@@ -122,16 +122,24 @@ export function buildTodo(
   let maxCvss: number | null = null;
   let maxEpss: number | null = null;
   let anyKev = false;
+  let kevConfirmed = false;
 
   for (const h of hits) {
-    if (severities.indexOf(severityOf(h.cvss)) > severities.indexOf(maxSeverity)) maxSeverity = severityOf(h.cvss);
+    if (h.kev) anyKev = true;
+    // A score is a fact about the CVE, so the columns stay useful for every hit that carries one.
     if (h.cvss !== null && (maxCvss === null || h.cvss > maxCvss)) maxCvss = h.cvss;
     if (h.epss !== null && (maxEpss === null || h.epss > maxEpss)) maxEpss = h.epss;
-    if (h.kev) anyKev = true;
+    // The *rating* however ignores an unconfirmed hit (its version range could not be checked):
+    // "the product name is in KEV" alone is not a finding, so it must not promote the entry.
+    if (h.unconfirmed === true) continue;
+    if (h.kev) kevConfirmed = true;
+    if (severities.indexOf(severityOf(h.cvss)) > severities.indexOf(maxSeverity)) maxSeverity = severityOf(h.cvss);
   }
-  if (anyKev && severities.indexOf(maxSeverity) < severities.indexOf("high")) maxSeverity = "high";
+  if (kevConfirmed && severities.indexOf(maxSeverity) < severities.indexOf("high")) maxSeverity = "high";
 
   const fix = pickFix(hits);
+
+  const unconfirmed = hits.filter((h) => h.unconfirmed === true).map((h) => h.cve_id);
 
   return {
     id: todoId(entry.id, hits.map((h) => h.cve_id)),
@@ -140,6 +148,8 @@ export function buildTodo(
     version: entry.version,
     publisher: entry.publisher,
     cves: hits,
+    /** KEV name matches whose version range could not be verified, listed apart from the findings. */
+    unconfirmed_cves: unconfirmed,
     max_severity: maxSeverity,
     max_cvss: maxCvss,
     any_kev: anyKev,

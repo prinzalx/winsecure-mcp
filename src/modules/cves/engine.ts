@@ -65,7 +65,11 @@ export function versionAffected(installed: string | null, rec: CveRecord): { aff
     return { affected: false, exact: true };
   }
 
-  return { affected: true, exact: Boolean(below && isNumericish(below) && from && isNumericish(from)) };
+  // Reached when the installed version sits inside the range. It counts as verified only when every
+  // bound the record carries is comparable, so a one-sided numeric range does verify a version below
+  // its upper bound, while a record with no bounds at all does not.
+  const bounds = [below, from].filter((b): b is string => b !== null);
+  return { affected: true, exact: bounds.length > 0 && bounds.every(isNumericish) };
 }
 
 function isNumericish(v: string): boolean {
@@ -110,11 +114,16 @@ export function matchProgram(
         match_confidence: verdict.exact ? cand.confidence : demote(cand.confidence),
         summary: rec.summary,
         published: rec.published,
+        ...(rec.cvss != null ? { cvss_source: "cvelist" as const } : {}),
       });
     }
   }
 
   // KEV is an overlay: it can promote a hit the index missed, and it always marks exploitation.
+  //
+  // The KEV feed itself carries no version range, so a KEV entry the product index does not know is
+  // verified against the local CVE record by CVE id. Without that check a name match alone produces
+  // false positives (Chrome 120 hit CVE-2020-16017, which only affects Chrome < 86).
   for (const kevEntry of kevForProduct(kev, entry.name)) {
     const hit = byId.get(kevEntry.cve_id);
     if (hit) {
@@ -122,10 +131,16 @@ export function matchProgram(
       hit.kev_due_date = kevEntry.due_date;
       continue;
     }
-    // A KEV hit the product index does not carry is only kept when the product name matched exactly,
-    // because the KEV feed has no version range to check against. The local index is still consulted
-    // by CVE id, so the hit does not render as cvss null / severity none while the todo says high.
     const detail = index.byCve?.get(kevEntry.cve_id) ?? null;
+
+    // A known range that excludes the installed version drops the hit entirely.
+    const verdict = detail ? versionAffected(entry.version, detail) : null;
+    if (verdict && !verdict.affected) continue;
+
+    // No record, or bounds that cannot be compared: the version was not verified, so the hit stays
+    // unconfirmed and is reported apart instead of lifting the severity of the whole to-do.
+    const unconfirmed = verdict === null || !verdict.exact;
+
     byId.set(kevEntry.cve_id, {
       cve_id: kevEntry.cve_id,
       cvss: detail?.cvss ?? null,
@@ -135,9 +150,11 @@ export function matchProgram(
       epss: null,
       fixed_version: detail?.fixed_version ?? null,
       matched_by: "kev_product",
-      match_confidence: "medium",
+      match_confidence: unconfirmed ? "low" : "medium",
       summary: detail?.summary ?? kevEntry.name,
       published: detail?.published ?? null,
+      ...(unconfirmed ? { unconfirmed: true } : {}),
+      ...(detail?.cvss != null ? { cvss_source: "cvelist" as const } : {}),
     });
   }
 

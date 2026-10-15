@@ -86,10 +86,44 @@ test("matchProgram marks the product-index hit and lets KEV flag exploitation", 
   // The version range excludes this one, so it must not appear as a hit.
   assert.equal(hits.find((h) => h.cve_id === "CVE-2026-2000"), undefined);
 
-  // A KEV entry the product index does not carry is kept, but without a version verdict.
+  // A KEV entry with no record behind it is kept, but unconfirmed: no version verdict is possible.
   const kevOnly = hits.find((h) => h.cve_id === "CVE-2026-3000");
   assert.equal(kevOnly.matched_by, "kev_product");
   assert.equal(kevOnly.cvss, null);
+  assert.equal(kevOnly.unconfirmed, true);
+  assert.equal(kevOnly.match_confidence, "low");
+});
+
+test("a KEV name match inside the record's version range is a confirmed hit", () => {
+  const entry = { id: "x", name: "Google Chrome", version: "120.0.6099.109", publisher: null, sources: [], package_ids: [], paths: [], match_hint: null, first_seen: "", last_seen: "" };
+  const record = { cve_id: "CVE-2020-16017", product: "chrome", vendor: "google", summary: "sandbox escape", published: null, cvss: 9.6, range_from: null, range_below: "86.0.4240.198", fixed_version: "86.0.4240.198" };
+  const index = { byProduct: new Map(), byCve: new Map([["CVE-2020-16017", record]]), totalCves: 1, products: 0, fetched_at: null, from: "cache" };
+  const kev = kevIndex([kevRow("CVE-2020-16017", "Chrome")]);
+  const { hits } = matchProgram(entry, index, kev);
+  assert.equal(hits.length, 0, "Chrome 120 is above the affected range, so the hit must be dropped");
+});
+
+test("a KEV name match below the range stays a hit and is not marked unconfirmed", () => {
+  const entry = { id: "x", name: "Google Chrome", version: "85.0.4183.121", publisher: null, sources: [], package_ids: [], paths: [], match_hint: null, first_seen: "", last_seen: "" };
+  const record = { cve_id: "CVE-2020-16017", product: "chrome", vendor: "google", summary: null, published: null, cvss: 9.6, range_from: null, range_below: "86.0.4240.198", fixed_version: "86.0.4240.198" };
+  const index = { byProduct: new Map(), byCve: new Map([["CVE-2020-16017", record]]), totalCves: 1, products: 0, fetched_at: null, from: "cache" };
+  const kev = kevIndex([kevRow("CVE-2020-16017", "Chrome")]);
+  const { hits } = matchProgram(entry, index, kev);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].kev, true);
+  assert.equal(hits[0].unconfirmed, undefined);
+  assert.equal(hits[0].cvss, 9.6);
+  assert.equal(hits[0].cvss_source, "cvelist");
+});
+
+test("an unverifiable KEV range is kept as a low-confidence unconfirmed hit", () => {
+  const entry = { id: "x", name: "Obscure App", version: "9.9", publisher: null, sources: [], package_ids: [], paths: [], match_hint: null, first_seen: "", last_seen: "" };
+  const index = { byProduct: new Map(), byCve: new Map(), totalCves: 1, products: 0, fetched_at: null, from: "cache" };
+  const kev = kevIndex([kevRow("CVE-2026-4242", "Obscure App")]);
+  const { hits } = matchProgram(entry, index, kev);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].unconfirmed, true);
+  assert.equal(hits[0].match_confidence, "low");
 });
 
 test("a KEV-only hit is enriched from the local index by CVE id", () => {

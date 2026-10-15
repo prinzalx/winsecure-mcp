@@ -215,7 +215,7 @@
             : `<table><thead><tr><th>Program</th><th>Version</th><th>CVEs</th><th>Severity</th><th>CVSS</th><th>EPSS</th><th>KEV</th><th>Confidence</th><th>Status</th><th>Fix</th></tr></thead><tbody>${t.top
                 .map(
                   (r) =>
-                    `<tr><td class="wrap">${esc(r.program)}</td><td>${esc(r.version ?? "—")}</td><td>${r.cve_count}</td>` +
+                    `<tr><td class="wrap">${esc(r.program)}</td><td>${esc(r.version ?? "—")}</td><td>${r.cve_count}${r.unconfirmed_count ? ` <span class="muted">(${r.unconfirmed_count} unconfirmed)</span>` : ""}</td>` +
                     `<td class="sev sev-${r.max_severity}">${r.max_severity}</td><td>${r.max_cvss ?? "—"}</td><td>${r.max_epss ?? "—"}</td>` +
                     `<td>${r.any_kev ? '<span class="pill kev">KEV</span>' : ""}</td><td>${esc(r.match_confidence)}</td>` +
                     `<td><span class="pill ${r.status}">${r.status}</span></td><td>${esc(r.fix_version ?? "—")}</td></tr>`,

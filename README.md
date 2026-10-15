@@ -43,7 +43,7 @@ client's log instead.
 █  █  █  █  █ █ █  ███  ████  █     █   █ ████  ████
 █ █ █ █  █  █  ██     █ █     █     █   █ █ █   █
  ██ ██  ███ █   █ █████ █████  ████  ███  █  ██ █████
-  version         v0.2.0
+  version         v0.3.0
   data directory  C:\Users\<user>\AppData\Roaming\winsecure-mcp
   store file      C:\Users\<user>\AppData\Roaming\winsecure-mcp\winsecure.json
   dashboard       http://127.0.0.1:8788
@@ -55,6 +55,26 @@ the severity breakdown, the top risks KEV-first, an activity log of every call t
 answered, and the eight tools with their full docs. Its two buttons run `scan_inventory` and
 `check_cves` through the same handlers an agent calls, so the page can never disagree with a tool
 answer. `--no-web` (or `WSMD_NO_WEB=1`) keeps it stdio-only; `--port` / `WSMD_PORT` move it off 8788.
+
+### Two ways to run it
+
+| Mode | Command | Who connects |
+|---|---|---|
+| **stdio** (default) | `node dist/index.js` | a client that spawns the server as its own child process |
+| **HTTP** | `node dist/index.js --http` | a client that connects by `url:` — the server is a long-lived process on the Windows host |
+
+In HTTP mode the MCP endpoint is `POST /mcp` (Streamable HTTP with real sessions) and the server
+binds `0.0.0.0` by default so a client outside the Windows network namespace — WSL — reaches it.
+`--host` / `WSMD_HOST` set the bind address explicitly, `--port` / `WSMD_PORT` the port (default
+**8788**, since winadmin-mcp owns 8787). The dashboard answers on the same port; `--no-web` turns
+only the dashboard off, never `/mcp`.
+
+**Why HTTP exists:** a client that spawns the server per stdio runs it in *its own* environment. On a
+WSL-hosted agent that means a Linux node looks for `powershell.exe`, `winget.exe` and the drive roots
+and finds none of them, so the inventory comes back `degraded` with zero programs. `scan_inventory`
+reports this honestly in its `environment` block (`platform`, `node`, `powershell_found`,
+`winget_found`) instead of claiming a clean "0 programs". Running the server on the Windows side and
+connecting by `url:` is the intended setup on such a host.
 
 ## The Tools
 
@@ -140,8 +160,9 @@ Defaults work out of the box; the server writes them out on first save.
 | `httpTimeoutMs` | per outbound request | 15000 |
 
 Environment overrides: `WSMD_CONFIG` (config file), `WSMD_DATA_DIR` (data directory),
-`WSMD_OFFLINE=1` (switch the network off — the offline test), `WSMD_PORT` / `WSMD_NO_WEB` (the
-dashboard). CLI `--config` / `--data-dir` / `--port` / `--no-web` win.
+`WSMD_OFFLINE=1` (switch the network off — the offline test), `WSMD_HTTP=1` / `WSMD_HOST` /
+`WSMD_PORT` (HTTP mode, its bind address and port), `WSMD_NO_WEB` (the dashboard). CLI
+`--http` / `--host` / `--config` / `--data-dir` / `--port` / `--no-web` win.
 
 ## Development
 
@@ -151,6 +172,7 @@ npm run build       # → dist/ (+ webui.html)
 npm test            # build + node --test tests/*.test.mjs
 node scripts/e2e.mjs --assess   # full real stdio run on this host
 node scripts/sampling-test.mjs  # proves both assessment paths
+node scripts/http-test.mjs      # spawns --http and drives a real session on /mcp
 node scripts/banner.mjs  # regenerate the console logo
 ```
 
@@ -169,23 +191,55 @@ Offline test (`WSMD_OFFLINE=1`, cold cache): inventory 357 programs, `cve_status
 
 A second probe ran the server in a Linux (WSL) sandbox where neither `powershell.exe` nor
 `winget.exe` is reachable. That is what shaped the source-health rule: a scan on a host it cannot
-see now reports `degraded: true` and names every source that contributed nothing (missing
-interpreter, no fixed drive) instead of claiming a clean "0 programs".
+see now reports `degraded: true`, names every source that contributed nothing (missing interpreter,
+no fixed drive) and adds the `environment` block, instead of claiming a clean "0 programs".
+
+## Matching Honesty (v0.3.0)
+
+Two rules keep the hit list trustworthy, both of them visible in the answer rather than buried:
+
+- **A KEV product-name match is version-checked.** The KEV feed carries no version range, so the hit
+  is verified against the local CVE record: outside the affected range it is **dropped** (Chrome
+  120 hit `CVE-2020-16017`, which NVD limits to Chrome *prior to 86.0.4240.198*), and when no range
+  can be evaluated the hit is kept **unconfirmed** — `match_confidence: "low"`, listed in
+  `unconfirmed_cves`, and it does not lift `max_severity`. `check_cves` counts them separately.
+- **A KEV hit is never rendered `severity: "none"` as if that were a fact.** Whatever the local index
+  does not score is completed from the disk-cached NVD helper before the to-do is built
+  (`nvd_enriched` in the answer), and a hit that stays unscored carries `cvss_source:
+  "nvd_unreachable"` / `"nvd_no_score"` so hit level and to-do level cannot disagree.
 
 ### Registration in Hermes
 
+Run the server on the Windows host and connect by url, the same way winadmin-mcp is connected:
+
+```yaml
+  winsecure:
+    url: http://172.28.176.1:8788/mcp
+    enabled: true
+```
+
+`172.28.176.1` is the Windows side of the `vEthernet (WSL)` adapter, i.e. the address a WSL Hermes
+reaches. Open the port for the WSL subnet only — not for every interface:
+
+```powershell
+netsh advfirewall firewall add rule name="winsecure-mcp" dir=in action=allow protocol=TCP localport=8788 remoteip=172.28.160.0/20
+```
+
+The old stdio entry (`command: node`, `args: [.../dist/index.js]`) is what caused the empty
+inventory, because it started the server inside WSL; replace it with the `url:` form above.
+
 Register with `manage_connections install`, then — after any server restart —
 `manage_connections enable`. **Note:** Hermes is not installed on this host, so the registration and
-the live sampling path could not be exercised here; the tools were all proven callable over real stdio
-MCP (`scripts/e2e.mjs` lists and calls all 8), and the sampling path is proven with a mock-capable
-client (`scripts/sampling-test.mjs`). Hermes uses the tool-name prefix `mcp__winsecure__`; match on the
-name behind the prefix.
+the live sampling path could not be exercised here; the tools were all proven callable over real
+stdio MCP (`scripts/e2e.mjs` lists and calls all 8) and over HTTP (`scripts/http-test.mjs`), and the
+sampling path is proven with a mock-capable client (`scripts/sampling-test.mjs`). Hermes uses the
+tool-name prefix `mcp__winsecure__`; match on the name behind the prefix.
 
 ## Project Structure
 
 ```
 src/
-  index.ts            MCP server, stdio transport, sampling handshake, dashboard HTTP
+  index.ts            MCP server, stdio + Streamable HTTP transports, sampling handshake, dashboard
   dashboard.ts        dashboard state + the in-memory activity ring buffer
   webui.html          the dashboard page (copied to dist/ by the build)
   config.ts           defaults + config file + CLI/env overrides
@@ -198,5 +252,6 @@ src/
 skills/windows-cve-triage/SKILL.md
 ```
 
-The dashboard binds to `127.0.0.1` only, and its run endpoint goes through the same tool handlers,
-so the "only writes to its own files" rule holds on the web path too.
+The dashboard binds to `127.0.0.1` in stdio mode, and its run endpoint goes through the same tool
+handlers, so the "only writes to its own files" rule holds on the web path too. In `--http` mode the
+same port serves `/mcp` and the dashboard on the public bind address.

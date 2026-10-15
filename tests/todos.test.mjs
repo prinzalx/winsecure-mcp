@@ -58,6 +58,24 @@ test("buildTodo promotes a KEV hit to at least high", () => {
   assert.equal(todo.any_kev, true);
 });
 
+test("buildTodo keeps an unconfirmed KEV match out of the severity rating", () => {
+  const todo = buildTodo(entry, [hit("CVE-2024-0001", { cvss: 5, kev: true, unconfirmed: true })], "low", "checked");
+  assert.deepEqual(todo.unconfirmed_cves, ["CVE-2024-0001"]);
+  // The CVSS column still reports the score (it is a fact about the CVE), but neither the band nor
+  // the KEV promotion to high applies, so the entry carries no severity claim of its own.
+  assert.equal(todo.max_severity, "none");
+  assert.equal(todo.max_cvss, 5);
+  assert.equal(todo.any_kev, true);
+
+  // A confirmed hit of the same severity is rated, so the separation only concerns the unconfirmed one.
+  const mixed = buildTodo(entry, [
+    hit("CVE-2024-0001", { cvss: 9, kev: true, unconfirmed: true }),
+    hit("CVE-2024-0002", { cvss: 3 }),
+  ], "low", "checked");
+  assert.equal(mixed.max_severity, "low");
+  assert.equal(mixed.max_cvss, 9);
+});
+
 test("todoId is stable for the same facts and changes with a new CVE set", () => {
   const a = todoId("abc", ["CVE-2", "CVE-1"]);
   assert.equal(a, todoId("abc", ["CVE-1", "CVE-2"]));

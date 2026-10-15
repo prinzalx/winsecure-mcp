@@ -14,8 +14,10 @@ function summarize(todos: Todo[]): string {
     .slice(0, 40)
     .map((t) => {
       const flag = t.any_kev ? "KEV" : "   ";
-      const assessed = t.status;
-      return `${t.id}  ${flag}  ${t.max_severity.padEnd(8)}  cvss ${fmt(t.max_cvss)}  epss ${fmt(t.max_epss)}  ${String(t.cves.length).padStart(3)} CVE  ${t.match_confidence.padEnd(6)}  ${assessed}  ${t.program} ${t.version ?? ""}`;
+      // A todo whose hits could not be version-checked says so, so the reader never mistakes a name
+      // match for a confirmed vulnerability.
+      const marks = t.unconfirmed_cves?.length ? `unconfirmed:${String(t.unconfirmed_cves.length)}` : "-";
+      return `${t.id}  ${flag}  ${t.max_severity.padEnd(8)}  cvss ${fmt(t.max_cvss)}  epss ${fmt(t.max_epss)}  ${String(t.cves.length).padStart(3)} CVE  ${t.match_confidence.padEnd(6)}  ${marks.padEnd(13)}  ${t.status}  ${t.program} ${t.version ?? ""}`;
     })
     .join("\n");
 }
@@ -205,6 +207,7 @@ export const todoTools: ToolDefinition[] = [
     input: z.object({
       todo_id: z
         .string()
+        .min(1)
         .optional()
         .describe("Reset a single to-do to open. Omit (or use \"*\") to clear the entire list"),
     }),

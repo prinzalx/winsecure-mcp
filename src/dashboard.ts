@@ -62,6 +62,8 @@ export interface DashboardState {
     assessed: number;
     dismissed: number;
     kev: number;
+    /** Active entries that carry at least one hit whose version could not be verified. */
+    with_unconfirmed: number;
     by_severity: Record<(typeof SEVERITIES)[number], number>;
     with_epss: number;
     assessed_share: number | null;
@@ -77,6 +79,8 @@ export interface DashboardTodoRow {
   program: string;
   version: string | null;
   cve_count: number;
+  /** CVE ids carried for the record whose version could not be verified. */
+  unconfirmed_count: number;
   max_severity: Todo["max_severity"];
   max_cvss: number | null;
   max_epss: number | null;
@@ -95,6 +99,7 @@ function todoRow(t: Todo): DashboardTodoRow {
     program: t.program,
     version: t.version,
     cve_count: t.cves.length,
+    unconfirmed_count: t.unconfirmed_cves?.length ?? 0,
     max_severity: t.max_severity,
     max_cvss: t.max_cvss,
     max_epss: t.max_epss,
@@ -143,10 +148,12 @@ export function computeState(options: {
   const bySeverity = { critical: 0, high: 0, medium: 0, low: 0, none: 0 };
   let kev = 0;
   let withEpss = 0;
+  let withUnconfirmed = 0;
   for (const t of active) {
     bySeverity[t.max_severity] = (bySeverity[t.max_severity] ?? 0) + 1;
     if (t.any_kev) kev += 1;
     if (t.max_epss !== null) withEpss += 1;
+    if ((t.unconfirmed_cves?.length ?? 0) > 0) withUnconfirmed += 1;
   }
 
   // Same order list_todos uses, so the dashboard cards and the tool answer agree.
@@ -182,6 +189,7 @@ export function computeState(options: {
       assessed: store.todos.filter((t) => t.status === "assessed").length,
       dismissed: store.todos.filter((t) => t.status === "dismissed").length,
       kev,
+      with_unconfirmed: withUnconfirmed,
       by_severity: bySeverity,
       with_epss: withEpss,
       assessed_share: active.length === 0 ? null : Math.round((store.todos.filter((t) => t.status === "assessed").length / active.length) * 100),

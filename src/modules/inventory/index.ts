@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { ToolDefinition } from "../../types.js";
 import { fail, ok } from "../../utils/result.js";
 import { countSources, dedupePrograms } from "./dedupe.js";
-import { findPortablePrograms, fixedRoots, readRegistryPrograms, readWingetPrograms } from "./sources.js";
+import { findPortablePrograms, fixedRoots, probeCommands, readRegistryPrograms, readWingetPrograms } from "./sources.js";
 import type { RawProgram } from "../../model.js";
 
 const SOURCES = ["registry", "winget", "portable"] as const;
@@ -49,6 +49,10 @@ export const inventoryTools: ToolDefinition[] = [
       const want = wanted(args);
       const settings = ctx.config.settings;
       const errors: Record<string, string> = {};
+      // Asking for a Windows source on a host without the interpreters costs a lookup per name, not
+      // a scan, so the answer can say why the counters are empty.
+      const tools = probeCommands();
+      const windowsVisible = process.platform === "win32" && tools.powershell;
       const programs: RawProgram[] = [];
       const counters: Record<string, number> = { registry: 0, winget: 0, portable: 0 };
       const report: Record<string, unknown> = {};
@@ -105,6 +109,17 @@ export const inventoryTools: ToolDefinition[] = [
         }
       }
 
+      if (!windowsVisible) {
+        // Without a Windows process the sources cannot be read at all, which must never be reported
+        // as a clean scan of zero programs.
+        const why =
+          process.platform !== "win32"
+            ? `Windows sources unreachable: the server is not running as a Windows process (platform ${process.platform})`
+            : "Windows sources unreachable: powershell.exe could not be started";
+        errors.environment = why;
+        if (tools.winget === false) errors.winget = "winget.exe not found";
+      }
+
       const store = ctx.store.load();
       const entries = dedupePrograms(programs, store.inventory);
       store.inventory = entries;
@@ -118,6 +133,13 @@ export const inventoryTools: ToolDefinition[] = [
         {
           scanned_at: store.updated_at,
           sources_read: [...want],
+          /** The host the server actually sees, so a Linux-side process cannot pretend to be Windows. */
+          environment: {
+            platform: process.platform,
+            node: process.execPath,
+            powershell_found: tools.powershell,
+            winget_found: tools.winget,
+          },
           counters,
           deduplicated: entries.length,
           duplicates_merged: Math.max(0, programs.length - entries.length),

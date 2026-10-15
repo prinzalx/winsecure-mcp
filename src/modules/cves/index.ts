@@ -1,10 +1,90 @@
 import { z } from "zod";
 
-import type { ToolDefinition } from "../../types.js";
+import type { ToolDefinition, ToolContext } from "../../types.js";
 import { fail, ok } from "../../utils/result.js";
 import { CVELIST_FULL_CORPUS_ESTIMATE, fetchEpss, kevForProduct, loadKev, loadProductIndex, nvdCveDetail } from "../cves/feeds.js";
-import { matchProgram } from "../cves/engine.js";
+import { matchProgram, severityOf } from "../cves/engine.js";
+import type { CveHit } from "../../model.js";
 import { buildTodo, mergeTodo } from "../todos/todo.js";
+
+/** Extracts the english description and the highest CVSS out of an NVD API 2.0 answer. */
+function nvdFields(cve: Record<string, unknown>): { cvss: number | null; description: string | null } {
+  const metrics = (cve.metrics ?? {}) as Record<string, { cvssData?: { baseScore?: number } }[]>;
+  const scoreOf = (key: string): number | undefined => {
+    const score = metrics[key]?.[0]?.cvssData?.baseScore;
+    return typeof score === "number" ? score : undefined;
+  };
+  const descriptions = (cve.descriptions ?? []) as { value?: string; lang?: string }[];
+  // NVD mixes translated ADP descriptions into the list, so the english entry is preferred and only
+  // the first one is kept.
+  const english = descriptions.find((d) => String(d.lang ?? "").toLowerCase().startsWith("en"));
+  return {
+    cvss: scoreOf("cvssMetricV40") ?? scoreOf("cvssMetricV31") ?? null,
+    description: String((english ?? descriptions[0])?.value ?? "").replace(/\s+/g, " ").trim(),
+  };
+}
+
+/** How many unscored CVEs one `check_cves` run may look up at NVD (keyless rate limit is 4 / 30 s). */
+const NVD_ENRICH_CAP = 20;
+
+/**
+ * Fills the missing CVSS of KEV hits from the cached NVD answer.
+ *
+ * The local cvelist index is already consulted by the engine; whatever is still unscored is looked
+ * up through the disk-cached NVD helper (24 h TTL, so a warm store costs no call at all). Each CVE
+ * is fetched at most once per run and the answer is applied to every hit that carries it, because
+ * one program's hit list is not worth thirty live calls. A hit that stays unscored is marked
+ * `cvss_source: "unreachable"` rather than reported as `severity: "none"`.
+ */
+async function enrichKevHits(ctx: ToolContext, hits: CveHit[]): Promise<number> {
+  const missing: CveHit[] = [];
+  const seen = new Set<string>();
+  for (const hit of hits) {
+    if (!hit.kev || hit.cvss !== null || hit.cvss_source !== undefined) continue;
+    if (seen.has(hit.cve_id) || missing.length >= NVD_ENRICH_CAP) continue;
+    seen.add(hit.cve_id);
+    missing.push(hit);
+  }
+
+  let enriched = 0;
+  let failures = 0;
+  for (const hit of missing) {
+    // Two dead lookups in a row mean NVD is unreachable or throttling; the rest stay unenriched
+    // instead of burning the rate limit on the same answer.
+    if (failures >= 2) {
+      hit.cvss_source = "nvd_unreachable";
+      continue;
+    }
+    const res = await nvdCveDetail(ctx.http, ctx.config.settings.httpTimeoutMs, hit.cve_id);
+    const first = res.data
+      ? ((res.data as { vulnerabilities?: { cve?: Record<string, unknown> }[] }).vulnerabilities ?? [])[0]
+      : undefined;
+    const fields = first?.cve ? nvdFields(first.cve) : null;
+
+    if (!res.data || !fields) {
+      failures += 1;
+      hit.cvss_source = "nvd_unreachable";
+      continue;
+    }
+    failures = 0;
+    if (fields.cvss !== null) {
+      hit.cvss = fields.cvss;
+      hit.severity = severityOf(fields.cvss);
+      hit.cvss_source = "nvd";
+      enriched += 1;
+    } else {
+      hit.cvss_source = res.from === "none" ? "nvd_unreachable" : "nvd_no_score";
+    }
+    if (hit.summary === null && fields.description) hit.summary = fields.description.slice(0, 300);
+    if (hit.published === null) hit.published = (first?.cve?.published as string | undefined) ?? null;
+  }
+
+  // Whatever the loop capped or skipped still gets an honest marker, so no hit reads as scored.
+  for (const hit of hits) {
+    if (hit.kev && hit.cvss === null && hit.cvss_source === undefined) hit.cvss_source = "nvd_unreachable";
+  }
+  return enriched;
+}
 
 export const cveTools: ToolDefinition[] = [
   {
@@ -45,23 +125,39 @@ export const cveTools: ToolDefinition[] = [
 
       const openTodos = store.todos.filter((t) => t.status !== "dismissed");
       const newTodos: import("../../model.js").Todo[] = [];
+      let unconfirmedTotal = 0;
       let programsChecked = 0;
       let hitsTotal = 0;
       let kevHits = 0;
+      let nvdEnriched = 0;
 
       if (dataAvailable) {
+        const matched: { entry: import("../../model.js").InventoryEntry; hits: import("../../model.js").CveHit[] }[] = [];
         for (const entry of store.inventory) {
           const { hits } = matchProgram(entry, index, kev);
           if (hits.length === 0) continue;
+          matched.push({ entry, hits });
+        }
+
+        // A KEV hit the local index carries no score for is completed from the cached NVD helper
+        // before any todo is built, so the hit level and the todo level can never disagree.
+        nvdEnriched = await enrichKevHits(ctx, matched.flatMap((m) => m.hits));
+
+        for (const { entry, hits } of matched) {
           programsChecked += 1;
           hitsTotal += hits.length;
           kevHits += hits.filter((h) => h.kev).length;
+          unconfirmedTotal += hits.filter((h) => h.unconfirmed === true).length;
 
-          const confidence = hits.some((h) => h.match_confidence === "low")
+          // Only the confirmed hits decide how sure the whole entry is: an unverifiable KEV name match
+          // must not pull a certain finding down to "low".
+          const confirmed = hits.filter((h) => h.unconfirmed !== true);
+          const rated = confirmed.length > 0 ? confirmed : hits;
+          const confidence = rated.some((h) => h.match_confidence === "low")
             ? "low"
-            : hits.every((h) => h.match_confidence === "exact")
+            : rated.every((h) => h.match_confidence === "exact")
               ? "exact"
-              : hits.some((h) => h.match_confidence === "high")
+              : rated.some((h) => h.match_confidence === "high")
                 ? "high"
                 : "medium";
 
@@ -70,7 +166,7 @@ export const cveTools: ToolDefinition[] = [
         }
 
         if (args.with_epss !== false) {
-          const cveIds = newTodos.flatMap((t) => t.cves.map((c) => c.cve_id));
+          const cveIds = newTodos.flatMap((t) => t.cves.filter((c) => c.unconfirmed !== true).map((c) => c.cve_id));
           const scores = await fetchEpss(ctx.http, ttl(settings.epssTtlHours), cveIds);
           for (const t of newTodos) {
             for (const c of t.cves) if (scores.has(c.cve_id)) c.epss = scores.get(c.cve_id) ?? null;
@@ -96,6 +192,13 @@ export const cveTools: ToolDefinition[] = [
           programs_with_hits: programsChecked,
           cve_hits: hitsTotal,
           kev_hits: kevHits,
+          /**
+           * Hits whose version could not be verified (product-name match only). They are carried in
+           * the todos but do not lift `max_severity`, so a thin local index never inflates the risk.
+           */
+          unconfirmed_hits: unconfirmedTotal,
+          /** Unscored KEV hits this run completed from NVD (the cached helper); the rest stay marked unenriched. */
+          nvd_enriched: nvdEnriched,
           kev: { total: kev.total, from: kev.from, fetched_at: kev.fetched_at },
           cvelist: {
             cves: index.totalCves,
@@ -113,7 +216,9 @@ export const cveTools: ToolDefinition[] = [
         },
         cveStatus === "unknown"
           ? `No CVE data reachable: inventory kept, ${String(store.todos.length)} todo(s) unchanged.`
-          : `${String(hitsTotal)} CVE hit(s) on ${String(programsChecked)} program(s), ${String(kevHits)} actively exploited. ${String(store.todos.length)} todo(s) stored.`,
+          : `${String(hitsTotal)} CVE hit(s) on ${String(programsChecked)} program(s), ${String(kevHits)} actively exploited` +
+            `${unconfirmedTotal > 0 ? `, ${String(unconfirmedTotal)} unconfirmed (name match only, excluded from severity)` : ""}. ` +
+            `${String(store.todos.length)} todo(s) stored.`,
       );
     },
   },

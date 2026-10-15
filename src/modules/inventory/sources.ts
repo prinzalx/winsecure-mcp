@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+
 import { asArray, psQuote, runPowerShell } from "../../utils/powershell.js";
 import { normVersion, squeeze } from "../../utils/matching.js";
 import type { RawProgram } from "../../model.js";
@@ -157,6 +159,28 @@ export async function readWingetPrograms(timeoutMs = 180_000): Promise<{ program
 function isPackageId(id: string): boolean {
   if (/^(ARP|MSIX)\\/i.test(id)) return false;
   return /^[A-Za-z0-9]+([._-][A-Za-z0-9]+)+$/.test(id);
+}
+
+/**
+ * Whether the two interpreters the Windows sources need can actually be started.
+ *
+ * This answers the question a scan cannot: on a machine where the server runs as a Linux process
+ * (the stdio child inside WSL) every Windows source comes back empty, and the reason is the missing
+ * interpreter, not an empty registry. Reported next to the counters instead of "0 programs".
+ */
+export function probeCommands(): { powershell: boolean; winget: boolean; finder: string } {
+  // `where.exe` is part of Windows; WSL and a minimal container get `which`. Both are only asked
+  // whether a name resolves, so nothing is executed.
+  const finder = process.platform === "win32" ? "where.exe" : "which";
+  const found = (cmd: string): boolean => {
+    try {
+      const res = spawnSync(finder, [cmd], { timeout: 5_000, encoding: "utf8" });
+      return res.status === 0;
+    } catch {
+      return false;
+    }
+  };
+  return { powershell: found("powershell.exe"), winget: found("winget.exe"), finder };
 }
 
 /**

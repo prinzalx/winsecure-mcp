@@ -76,6 +76,19 @@ export interface CveHit {
   match_confidence: MatchConfidence;
   summary: string | null;
   published: string | null;
+  /**
+   * Set when the source carried no version range that could be checked, so the hit is only a
+   * product-name match. Such a hit is listed apart from the confirmed ones and never lifts the
+   * severity of its to-do.
+   */
+  unconfirmed?: boolean;
+  /**
+   * Where `cvss` came from, so a missing score is never read as "scored zero". It is only set when
+   * a source really carried the score, or to mark an enrichment attempt that did not reach one
+   * (`nvd_unreachable` = NVD was not reached, `nvd_no_score` = it answered without a CVSS). An unset
+   * field means no source had a score, which is shown as unscored rather than `severity: "none"`.
+   */
+  cvss_source?: "cvelist" | "nvd" | "nvd_unreachable" | "nvd_no_score";
 }
 
 /** The effort assessment on exactly the four axes the project defined. */
@@ -102,6 +115,11 @@ export interface Todo {
   version: string | null;
   publisher: string | null;
   cves: CveHit[];
+  /**
+   * CVE ids among `cves` whose version range could not be verified. They are carried along for the
+   * record and listed apart in the answers, but they do not decide `max_severity` or `max_cvss`.
+   */
+  unconfirmed_cves: string[];
   /** Highest severity across `cves`, precomputed so `list_todos` can sort without re-deriving. */
   max_severity: "none" | "low" | "medium" | "high" | "critical";
   max_cvss: number | null;
@@ -109,7 +127,7 @@ export interface Todo {
   max_epss: number | null;
   /** The newest `fixed_version` across the hits, when one is known. */
   fix_version: string | null;
-  /** Weakest confidence across the hits, so an unsure match is never shown as certain. */
+  /** Weakest confidence across the confirmed hits, so an unsure match is never shown as certain. */
   match_confidence: MatchConfidence;
   /** Whether the CVE data was actually reachable when this was computed. */
   cve_status: "checked" | "unknown";

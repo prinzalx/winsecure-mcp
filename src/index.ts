@@ -253,8 +253,10 @@ async function main(): Promise<void> {
 
     const listener = createServer(async (req, res) => {
       const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+      // Tolerate a trailing slash: some clients (and url: entries typed by hand) request "/mcp/".
+      const path = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
       try {
-        if (url.pathname === "/mcp") {
+        if (path === "/mcp") {
           await handleMcpHttp(req, res, rt);
           return;
         }

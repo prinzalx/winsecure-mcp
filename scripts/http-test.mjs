@@ -15,18 +15,21 @@ const server = spawn(process.execPath, ["dist/index.js", "--http", "--no-web", "
 });
 server.stderr.on("data", (c) => process.stderr.write(String(c)));
 
-async function rpc(payload, sessionId) {
+async function rpc(payload, sessionId, endpoint = base) {
   const headers = {
     Accept: "application/json, text/event-stream",
     "Content-Type": "application/json",
     "MCP-Protocol-Version": "2025-06-18",
   };
   if (sessionId) headers["mcp-session-id"] = sessionId;
-  const res = await fetch(base, { method: "POST", headers, body: JSON.stringify(payload) });
+  const res = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(payload) });
   const text = await res.text();
   if (!res.ok) throw new Error(`${payload.method} → HTTP ${String(res.status)}: ${text.slice(0, 200)}`);
   const payloadText = text.includes("data:") ? text.split("data:").slice(1).join("data:").trim() : text.trim();
+  const contentType = res.headers.get("content-type") ?? "";
+  if (contentType.includes("text/html")) throw new Error(`${payload.method} → HTML from ${endpoint} (routed to the dashboard, not MCP)`);
   return {
+    contentType,
     sessionId: res.headers.get("mcp-session-id") ?? null,
     // A notification is answered with 202 and no body at all.
     body: payloadText === "" ? {} : JSON.parse(payloadText),
@@ -63,6 +66,16 @@ while (Date.now() - started < 20_000) {
       headers: { Accept: "application/json, text/event-stream", "mcp-session-id": sid, "MCP-Protocol-Version": "2025-06-18" },
     });
     console.log(`DELETE → HTTP ${String(deleted.status)}`);
+
+    // Regression guard: a trailing slash must reach the MCP transport and not fall through to the
+    // dashboard (which would answer HTML). Done last, so the main session stays untouched.
+    const slashed = await rpc({ jsonrpc: "2.0", id: 5, method: "initialize", params: {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "http-test-slash", version: "0.0.0" },
+    } }, undefined, `${base}/`);
+    if (!slashed.sessionId) throw new Error("/mcp/ did not return a session id");
+    console.log(`/mcp/ → ${slashed.contentType.split(";")[0]}, session ${String(slashed.sessionId).slice(0, 8)}`);
     break;
   } catch (cause) {
     if (!up && Date.now() - started > 19_000) throw cause;

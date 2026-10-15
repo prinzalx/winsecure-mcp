@@ -33,7 +33,9 @@ npm run build
 node dist/index.js
 ```
 
-The server prints an ASCII logo and announces where it lives — output, not arguments:
+Started in a terminal, the server prints an ASCII logo and announces where it lives. Under an MCP
+client such as Hermes it does not own a console: stdout carries the protocol and this goes to the
+client's log instead.
 
 ```
 █     █ ███ █   █ █████ █████  ████ █   █ ████  █████
@@ -41,7 +43,7 @@ The server prints an ASCII logo and announces where it lives — output, not arg
 █  █  █  █  █ █ █  ███  ████  █     █   █ ████  ████
 █ █ █ █  █  █  ██     █ █     █     █   █ █ █   █
  ██ ██  ███ █   █ █████ █████  ████  ███  █  ██ █████
-  version         v0.1.0
+  version         v0.2.0
   data directory  C:\Users\<user>\AppData\Roaming\winsecure-mcp
   store file      C:\Users\<user>\AppData\Roaming\winsecure-mcp\winsecure.json
   dashboard       http://127.0.0.1:8788
@@ -50,7 +52,7 @@ The server prints an ASCII logo and announces where it lives — output, not arg
 
 Open <http://127.0.0.1:8788> in a browser for the **web dashboard**: inventory and to-do statistics,
 the severity breakdown, the top risks KEV-first, an activity log of every call this server session
-answered, and the seven tools with their full docs. Its two buttons run `scan_inventory` and
+answered, and the eight tools with their full docs. Its two buttons run `scan_inventory` and
 `check_cves` through the same handlers an agent calls, so the page can never disagree with a tool
 answer. `--no-web` (or `WSMD_NO_WEB=1`) keeps it stdio-only; `--port` / `WSMD_PORT` move it off 8788.
 
@@ -149,7 +151,7 @@ npm run build       # → dist/ (+ webui.html)
 npm test            # build + node --test tests/*.test.mjs
 node scripts/e2e.mjs --assess   # full real stdio run on this host
 node scripts/sampling-test.mjs  # proves both assessment paths
-node scripts/banner.mjs WINSECURE MCP  # regenerate the console logo
+node scripts/banner.mjs  # regenerate the console logo
 ```
 
 ### End-to-end run on a Windows 11 test host (real numbers)
@@ -175,7 +177,7 @@ interpreter, no fixed drive) instead of claiming a clean "0 programs".
 Register with `manage_connections install`, then — after any server restart —
 `manage_connections enable`. **Note:** Hermes is not installed on this host, so the registration and
 the live sampling path could not be exercised here; the tools were all proven callable over real stdio
-MCP (`scripts/e2e.mjs` lists and calls all 7), and the sampling path is proven with a mock-capable
+MCP (`scripts/e2e.mjs` lists and calls all 8), and the sampling path is proven with a mock-capable
 client (`scripts/sampling-test.mjs`). Hermes uses the tool-name prefix `mcp__winsecure__`; match on the
 name behind the prefix.
 

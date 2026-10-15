@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>winsecure-mcp — dashboard</title>
+    <style>
+      :root {
+        --bg: #10141a;
+        --panel: #1a212c;
+        --panel-2: #212b39;
+        --line: #2d3a4d;
+        --text: #e6edf3;
+        --muted: #94a3b8;
+        --accent: #4cc2ff;
+        --green: #3fb950;
+        --yellow: #d29922;
+        --orange: #db6d28;
+        --red: #f85149;
+        --purple: #bc8cff;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.5 "Segoe UI", system-ui, sans-serif;
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: baseline;
+        padding: 18px 24px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+      }
+      header h1 { margin: 0; font-size: 20px; letter-spacing: 0.5px; }
+      header .meta { color: var(--muted); font-size: 12px; }
+      header .spacer { flex: 1; }
+      main { padding: 20px 24px 48px; max-width: 1200px; margin: 0 auto; }
+      h2 {
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 1.2px;
+        color: var(--muted);
+        margin: 28px 0 10px;
+      }
+      .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 14px 16px;
+      }
+      .card .num { font-size: 26px; font-weight: 600; }
+      .card .label { color: var(--muted); font-size: 12px; margin-top: 2px; }
+      .card .sub { color: var(--muted); font-size: 11px; margin-top: 6px; }
+      table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+      th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+      th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; }
+      tr:last-child td { border-bottom: none; }
+      td.wrap { white-space: normal; }
+      .sev { font-weight: 600; }
+      .sev-critical { color: var(--red); }
+      .sev-high { color: var(--orange); }
+      .sev-medium { color: var(--yellow); }
+      .sev-low { color: var(--green); }
+      .sev-none { color: var(--muted); }
+      .pill {
+        display: inline-block;
+        padding: 1px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        border: 1px solid var(--line);
+        background: var(--panel-2);
+        color: var(--muted);
+      }
+      .pill.kev { color: #fff; background: var(--red); border-color: var(--red); }
+      .pill.assessed { color: var(--green); border-color: var(--green); }
+      .pill.open { color: var(--accent); border-color: var(--accent); }
+      .pill.dismissed { color: var(--muted); }
+      .bar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: var(--panel-2); }
+      .bar div { height: 100%; }
+      .bar .critical { background: var(--red); }
+      .bar .high { background: var(--orange); }
+      .bar .medium { background: var(--yellow); }
+      .bar .low { background: var(--green); }
+      .bar .none { background: #3b4a5f; }
+      .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px; color: var(--muted); font-size: 12px; }
+      .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
+      button {
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 7px 14px;
+        cursor: pointer;
+        font: inherit;
+      }
+      button:hover { border-color: var(--accent); }
+      button[disabled] { opacity: 0.5; cursor: wait; }
+      .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 4px; }
+      .activity td { font-size: 13px; }
+      .ok { color: var(--green); }
+      .err { color: var(--red); }
+      .muted { color: var(--muted); }
+      details { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin-bottom: 8px; }
+      summary { cursor: pointer; }
+      summary code { color: var(--accent); }
+      details .body { color: var(--muted); margin-top: 8px; white-space: pre-wrap; }
+      code { font-family: Consolas, monospace; }
+      .empty { color: var(--muted); padding: 14px; }
+      footer { color: var(--muted); font-size: 12px; margin-top: 36px; }
+      #runlog {
+        margin-top: 10px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 12px 14px;
+        white-space: pre-wrap;
+        font-family: Consolas, monospace;
+        font-size: 12px;
+        display: none;
+        max-height: 260px;
+        overflow: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>winsecure-mcp</h1>
+      <span class="meta" id="meta">loading…</span>
+      <span class="spacer"></span>
+      <span class="meta">inventory → CVE hits → to-do list → AI effort assessment</span>
+    </header>
+    <main>
+      <div class="toolbar">
+        <button id="btn-scan">scan_inventory</button>
+        <button id="btn-check">check_cves</button>
+        <button id="btn-refresh">refresh view</button>
+      </div>
+      <div id="runlog"></div>
+
+      <h2>Inventory</h2>
+      <div class="cards" id="inv-cards"></div>
+
+      <h2>To-do list</h2>
+      <div class="cards" id="todo-cards"></div>
+      <div style="margin-top:12px">
+        <div class="bar" id="sev-bar"></div>
+        <div class="legend" id="sev-legend"></div>
+      </div>
+
+      <h2>Top risks (KEV first, then severity)</h2>
+      <div id="top-risks"></div>
+
+      <h2>Activity (this server session)</h2>
+      <div id="activity"></div>
+
+      <h2>Tools</h2>
+      <div id="tools"></div>
+
+      <footer id="footer"></footer>
+    </main>
+    <script>
+      const $ = (sel) => document.querySelector(sel);
+      const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+      async function api(path, opts) {
+        const res = await fetch(path, opts);
+        if (!res.ok) throw new Error(`${path} → HTTP ${res.status}`);
+        return res.json();
+      }
+
+      function card(num, label, sub) {
+        return `<div class="card"><div class="num">${esc(num)}</div><div class="label">${esc(label)}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ""}</div>`;
+      }
+
+      function render(state) {
+        $("#meta").textContent =
+          `v${state.version} · ${state.store_exists ? "store present" : "no scan stored yet"}` +
+          ` · client sampling ${state.client_sampling === null ? "— no client yet" : state.client_sampling ? "yes" : "no"}`;
+
+        const inv = state.inventory;
+        $("#inv-cards").innerHTML =
+          card(inv.programs, "programs (deduplicated)", inv.scanned_at ? `scanned ${inv.scanned_at}` : "never scanned") +
+          card(inv.per_source.registry ?? 0, "from registry", "HKLM + HKCU incl. WOW6432Node") +
+          card(inv.per_source.winget ?? 0, "from winget", "store / winget-managed") +
+          card(inv.per_source.portable ?? 0, "from portable .exe", "bounded drive walk") +
+          card(inv.with_package_id, "with package id", "strongest match identity");
+
+        const t = state.todos;
+        $("#todo-cards").innerHTML =
+          card(t.total, "todos total", `${t.open} open · ${t.assessed} assessed · ${t.dismissed} dismissed`) +
+          card(t.kev, "KEV entries", "actively exploited (CISA)") +
+          card(t.open, "still open", "not judged yet") +
+          (t.assessed_share === null ? card("—", "assessed share", "nothing to judge") : card(`${t.assessed_share}%`, "assessed share", "of non-dismissed"));
+
+        const sev = t.by_severity;
+        const totalSev = Math.max(1, sev.critical + sev.high + sev.medium + sev.low + sev.none);
+        $("#sev-bar").innerHTML = ["critical", "high", "medium", "low", "none"]
+          .map((k) => `<div class="${k}" style="width:${((sev[k] / totalSev) * 100).toFixed(1)}%" title="${k}: ${sev[k]}"></div>`)
+          .join("");
+        $("#sev-legend").innerHTML = ["critical", "high", "medium", "low", "none"]
+          .map((k) => {
+            const color = { critical: "var(--red)", high: "var(--orange)", medium: "var(--yellow)", low: "var(--green)", none: "#3b4a5f" }[k];
+            return `<span><span class="dot" style="background:${color}"></span>${k}: ${sev[k]}</span>`;
+          })
+          .join("");
+
+        $("#top-risks").innerHTML =
+          t.top.length === 0
+            ? '<div class="empty">No open todos — run check_cves or dismiss everything.</div>'
+            : `<table><thead><tr><th>Program</th><th>Version</th><th>CVEs</th><th>Severity</th><th>CVSS</th><th>EPSS</th><th>KEV</th><th>Confidence</th><th>Status</th><th>Fix</th></tr></thead><tbody>${t.top
+                .map(
+                  (r) =>
+                    `<tr><td class="wrap">${esc(r.program)}</td><td>${esc(r.version ?? "—")}</td><td>${r.cve_count}</td>` +
+                    `<td class="sev sev-${r.max_severity}">${r.max_severity}</td><td>${r.max_cvss ?? "—"}</td><td>${r.max_epss ?? "—"}</td>` +
+                    `<td>${r.any_kev ? '<span class="pill kev">KEV</span>' : ""}</td><td>${esc(r.match_confidence)}</td>` +
+                    `<td><span class="pill ${r.status}">${r.status}</span></td><td>${esc(r.fix_version ?? "—")}</td></tr>`,
+                )
+                .join("")}</tbody></table>`;
+
+        $("#activity").innerHTML =
+          state.activity.length === 0
+            ? '<div class="empty">No calls yet in this server session.</div>'
+            : `<table class="activity"><thead><tr><th>Time (UTC)</th><th>Tool</th><th>Origin</th><th>Result</th><th>ms</th><th>Summary</th></tr></thead><tbody>${state.activity
+                .map(
+                  (a) =>
+                    `<tr><td>${esc(a.at.replace("T", " ").replace(/\\.\\d+Z$/, "Z"))}</td><td><code>${esc(a.tool)}</code></td><td>${esc(a.origin)}</td>` +
+                    `<td class="${a.ok ? "ok" : "err"}">${a.ok ? "ok" : "error"}</td><td>${a.duration_ms}</td>` +
+                    `<td class="wrap muted">${esc(a.summary.slice(0, 140))}</td></tr>`,
+                )
+                .join("")}</tbody></table>`;
+
+        $("#tools").innerHTML = state.tools
+          .map(
+            (tool) =>
+              `<details><summary><code>${esc(tool.name)}</code> — ${esc(tool.title)} <span class="muted">[${esc(tool.module)}]</span></summary>` +
+              `<div class="body">${esc(tool.description)}\n\n${esc(tool.docs)}</div></details>`,
+          )
+          .join("");
+
+        $("#footer").textContent = `data: ${state.data_dir} · store: ${state.store_path} · server time ${state.server_time}`;
+      }
+
+      async function refresh() {
+        try {
+          render(await api("/api/state"));
+        } catch (err) {
+          $("#meta").textContent = String(err);
+        }
+      }
+
+      async function runTool(name) {
+        const log = $("#runlog");
+        const buttons = document.querySelectorAll(".toolbar button");
+        buttons.forEach((b) => (b.disabled = true));
+        log.style.display = "block";
+        log.textContent = `${name} running…`;
+        try {
+          const res = await api("/api/run", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ tool: name, args: {} }),
+          });
+          log.textContent = res.ok ? `[${name}] ${res.output}` : `[${name}] ERROR: ${res.output}`;
+        } catch (err) {
+          log.textContent = `[${name}] ${String(err)}`;
+        }
+        buttons.forEach((b) => (b.disabled = false));
+        await refresh();
+      }
+
+      $("#btn-scan").addEventListener("click", () => runTool("scan_inventory"));
+      $("#btn-check").addEventListener("click", () => runTool("check_cves"));
+      $("#btn-refresh").addEventListener("click", refresh);
+      refresh();
+      setInterval(refresh, 15000);
+    </script>
+  </body>
+</html>

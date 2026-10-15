@@ -21,18 +21,39 @@ this server deliberately has no approval gate.
 
 ## Quick Start
 
+You need [Node.js ≥ 20](https://nodejs.org) and npm. If you have never used Node before: install
+it with the installer from nodejs.org, then open a terminal (PowerShell) in the cloned repository
+and run the four commands below — they work from any folder.
+
 ```bash
+git clone https://github.com/prinzalx/winsecure-mcp.git
+cd winsecure-mcp
 npm ci
 npm run build
 node dist/index.js
 ```
 
+The server prints an ASCII-shadow logo and announces where it lives — output, not arguments:
+
 ```
+██╗   ██╗███╗   ██╗ █████╗ ███████╗███████╗██╗   ██╗██████╗ ███████╗
+██║   ██║████╗  ██║██╔══██╗██╔════╝██╔════╝██║   ██║██╔══██╗██╔════╝
+██║   ██║██╔██╗ ██║███████║█████╗  █████╗  ██║   ██║██████╔╝█████╗
+██║   ██║██║╚██╗██║██╔══██║██╔══╝  ██╔══╝  ██║   ██║██╔══██╗██╔══╝
+╚██████╔╝██║ ╚████║██║  ██║███████╗███████╗╚██████╔╝██║  ██║███████╗
+ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝
   version         v0.1.0
   data directory  C:\Users\<user>\AppData\Roaming\winsecure-mcp
   store file      C:\Users\<user>\AppData\Roaming\winsecure-mcp\winsecure.json
+  dashboard       http://127.0.0.1:8788
   MCP transport   stdio — this terminal stays attached to the agent
 ```
+
+Open <http://127.0.0.1:8788> in a browser for the **web dashboard**: inventory and to-do statistics,
+the severity breakdown, the top risks KEV-first, an activity log of every call this server session
+answered, and the seven tools with their full docs. Its two buttons run `scan_inventory` and
+`check_cves` through the same handlers an agent calls, so the page can never disagree with a tool
+answer. `--no-web` (or `WSMD_NO_WEB=1`) keeps it stdio-only; `--port` / `WSMD_PORT` move it off 8788.
 
 ## The Tools
 
@@ -112,19 +133,21 @@ Defaults work out of the box; the server writes them out on first save.
 | `httpTimeoutMs` | per outbound request | 15000 |
 
 Environment overrides: `WSMD_CONFIG` (config file), `WSMD_DATA_DIR` (data directory),
-`WSMD_OFFLINE=1` (switch the network off — the offline test). CLI `--config` / `--data-dir` win.
+`WSMD_OFFLINE=1` (switch the network off — the offline test), `WSMD_PORT` / `WSMD_NO_WEB` (the
+dashboard). CLI `--config` / `--data-dir` / `--port` / `--no-web` win.
 
 ## Development
 
 ```bash
 npm run typecheck   # tsc --noEmit
-npm run build       # → dist/
+npm run build       # → dist/ (+ webui.html)
 npm test            # build + node --test tests/*.test.mjs
 node scripts/e2e.mjs --assess   # full real stdio run on this host
 node scripts/sampling-test.mjs  # proves both assessment paths
+node scripts/banner.mjs WINSECURE MCP  # regenerate the console logo
 ```
 
-### End-to-end run on DESKTOP-F74SJA6 (real numbers)
+### End-to-end run on a Windows 11 test host (real numbers)
 
 ```
 scan_inventory → 357 programs after dedup (registry 205, winget 209, portable 40 cut at max)
@@ -136,6 +159,11 @@ cve_detail     → CVE-2024-21412: CVSS 8.1 — Internet Shortcut Files Security
 
 Offline test (`WSMD_OFFLINE=1`, cold cache): inventory 357 programs, `cve_status: "unknown"`,
 `source_errors: ["offline","offline"]`, no failures.
+
+A second probe ran the server in a Linux (WSL) sandbox where neither `powershell.exe` nor
+`winget.exe` is reachable. That is what shaped the source-health rule: a scan on a host it cannot
+see now reports `degraded: true` and names every source that contributed nothing (missing
+interpreter, no fixed drive) instead of claiming a clean "0 programs".
 
 ### Registration in Hermes
 
@@ -150,7 +178,9 @@ name behind the prefix.
 
 ```
 src/
-  index.ts            MCP server, stdio transport, sampling handshake
+  index.ts            MCP server, stdio transport, sampling handshake, dashboard HTTP
+  dashboard.ts        dashboard state + the in-memory activity ring buffer
+  webui.html          the dashboard page (copied to dist/ by the build)
   config.ts           defaults + config file + CLI/env overrides
   model.ts            domain types (english, locale-independent, ISO-8601 UTC)
   store.ts            single JSON file for inventory + to-do list (atomic rename)
@@ -160,3 +190,6 @@ src/
   modules/todos/      todo model (schema, evidence, merge) + tools
 skills/windows-cve-triage/SKILL.md
 ```
+
+The dashboard binds to `127.0.0.1` only, and its run endpoint goes through the same tool handlers,
+so the "only writes to its own files" rule holds on the web path too.

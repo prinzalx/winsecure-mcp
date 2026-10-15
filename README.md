@@ -43,7 +43,7 @@ client's log instead.
 █  █  █  █  █ █ █  ███  ████  █     █   █ ████  ████
 █ █ █ █  █  █  ██     █ █     █     █   █ █ █   █
  ██ ██  ███ █   █ █████ █████  ████  ███  █  ██ █████
-  version         v0.3.1
+  version         v0.3.2
   data directory  C:\Users\<user>\AppData\Roaming\winsecure-mcp
   store file      C:\Users\<user>\AppData\Roaming\winsecure-mcp\winsecure.json
   dashboard       http://127.0.0.1:8788
@@ -67,7 +67,9 @@ In HTTP mode the MCP endpoint is `POST /mcp` (Streamable HTTP with real sessions
 binds `0.0.0.0` by default so a client outside the Windows network namespace — WSL — reaches it.
 `--host` / `WSMD_HOST` set the bind address explicitly, `--port` / `WSMD_PORT` the port (default
 **8788**, since winadmin-mcp owns 8787). The dashboard answers on the same port; `--no-web` turns
-only the dashboard off, never `/mcp`.
+only the dashboard off, never `/mcp`. A request on `/mcp` belongs to the MCP transport and answers
+in JSON (an MCP error for a bare `curl`); only a browser `GET` that accepts `text/html` falls
+through to the dashboard.
 
 **Why HTTP exists:** a client that spawns the server per stdio runs it in *its own* environment. On a
 WSL-hosted agent that means a Linux node looks for `powershell.exe`, `winget.exe` and the drive roots

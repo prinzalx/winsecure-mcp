@@ -1,5 +1,6 @@
 # winsecure-mcp
 
+[![CI](https://github.com/prinzalx/winsecure-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/prinzalx/winsecure-mcp/actions/workflows/ci.yml)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2020-brightgreen)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 

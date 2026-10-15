@@ -257,8 +257,15 @@ async function main(): Promise<void> {
       const path = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
       try {
         if (path === "/mcp") {
-          await handleMcpHttp(req, res, rt);
-          return;
+          // Bare browsers accept text/html, so only such a request may fall through to the
+          // dashboard. Anything else belongs to the MCP transport, which reports its own errors
+          // (e.g. 406 "Client must accept text/event-stream") as JSON, like winadmin does.
+          const accept = String(req.headers.accept ?? "");
+          const dashboardProbe = req.method === "GET" && accept.includes("text/html");
+          if (!dashboardProbe) {
+            await handleMcpHttp(req, res, rt);
+            return;
+          }
         }
         if (!webDisabled) {
           await handleWeb(req, res, webCtx, store, activity);

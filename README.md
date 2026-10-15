@@ -43,7 +43,7 @@ client's log instead.
 █  █  █  █  █ █ █  ███  ████  █     █   █ ████  ████
 █ █ █ █  █  █  ██     █ █     █     █   █ █ █   █
  ██ ██  ███ █   █ █████ █████  ████  ███  █  ██ █████
-  version         v0.3.0
+  version         v0.3.1
   data directory  C:\Users\<user>\AppData\Roaming\winsecure-mcp
   store file      C:\Users\<user>\AppData\Roaming\winsecure-mcp\winsecure.json
   dashboard       http://127.0.0.1:8788

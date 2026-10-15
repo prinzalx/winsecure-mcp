@@ -46,7 +46,7 @@ client's log instead.
   version         v0.3.2
   data directory  C:\Users\<user>\AppData\Roaming\winsecure-mcp
   store file      C:\Users\<user>\AppData\Roaming\winsecure-mcp\winsecure.json
-  dashboard       http://127.0.0.1:8788
+  web interface   http://0.0.0.0:8788
   MCP transport   stdio — this terminal stays attached to the agent
 ```
 
@@ -56,20 +56,23 @@ answered, and the eight tools with their full docs. Its two buttons run `scan_in
 `check_cves` through the same handlers an agent calls, so the page can never disagree with a tool
 answer. `--no-web` (or `WSMD_NO_WEB=1`) keeps it stdio-only; `--port` / `WSMD_PORT` move it off 8788.
 
-### Two ways to run it
+### One process, two transports (the winadmin model)
 
-| Mode | Command | Who connects |
-|---|---|---|
-| **stdio** (default) | `node dist/index.js` | a client that spawns the server as its own child process |
-| **HTTP** | `node dist/index.js --http` | a client that connects by `url:` — the server is a long-lived process on the Windows host |
+Every start of `node dist/index.js` is a long-lived process that offers **both** transports at
+once, behind one listener:
 
-In HTTP mode the MCP endpoint is `POST /mcp` (Streamable HTTP with real sessions) and the server
-binds `0.0.0.0` by default so a client outside the Windows network namespace — WSL — reaches it.
-`--host` / `WSMD_HOST` set the bind address explicitly, `--port` / `WSMD_PORT` the port (default
-**8788**, since winadmin-mcp owns 8787). The dashboard answers on the same port; `--no-web` turns
-only the dashboard off, never `/mcp`. A request on `/mcp` belongs to the MCP transport and answers
-in JSON (an MCP error for a bare `curl`); only a browser `GET` that accepts `text/html` falls
-through to the dashboard.
+| Path | Purpose |
+|---|---|
+| `stdio` | the default MCP transport; a client may spawn the server as its own child process |
+| `POST /mcp` | MCP over Streamable HTTP with real sessions; a client connects by `url:` |
+| `/`, `/api/*` | the dashboard and its JSON endpoints |
+
+The server binds `0.0.0.0` by default so a client outside the Windows network namespace — WSL —
+reaches it. `--host` / `WSMD_HOST` set the bind address explicitly, `--port` / `WSMD_PORT` the port
+(default **8788**, since winadmin-mcp owns 8787). `--no-web` turns the listener off entirely, so
+then only stdio remains. Everything else on the port — including a bare `curl` to `/mcp` — belongs
+to the MCP transport and answers in JSON (a bare `curl` gets its `406 Not Acceptable` back, exactly
+like winadmin); the dashboard HTML lives on `/`.
 
 **Why HTTP exists:** a client that spawns the server per stdio runs it in *its own* environment. On a
 WSL-hosted agent that means a Linux node looks for `powershell.exe`, `winget.exe` and the drive roots
@@ -162,9 +165,9 @@ Defaults work out of the box; the server writes them out on first save.
 | `httpTimeoutMs` | per outbound request | 15000 |
 
 Environment overrides: `WSMD_CONFIG` (config file), `WSMD_DATA_DIR` (data directory),
-`WSMD_OFFLINE=1` (switch the network off — the offline test), `WSMD_HTTP=1` / `WSMD_HOST` /
-`WSMD_PORT` (HTTP mode, its bind address and port), `WSMD_NO_WEB` (the dashboard). CLI
-`--http` / `--host` / `--config` / `--data-dir` / `--port` / `--no-web` win.
+`WSMD_OFFLINE=1` (switch the network off — the offline test), `WSMD_HOST` / `WSMD_PORT` (the
+listener's bind address and port), `WSMD_NO_WEB` (the dashboard). CLI
+`--host` / `--config` / `--data-dir` / `--port` / `--no-web` win.
 
 ## Development
 
@@ -174,7 +177,7 @@ npm run build       # → dist/ (+ webui.html)
 npm test            # build + node --test tests/*.test.mjs
 node scripts/e2e.mjs --assess   # full real stdio run on this host
 node scripts/sampling-test.mjs  # proves both assessment paths
-node scripts/http-test.mjs      # spawns --http and drives a real session on /mcp
+node scripts/http-test.mjs      # drives a real MCP session on /mcp over HTTP
 node scripts/banner.mjs  # regenerate the console logo
 ```
 
@@ -254,6 +257,6 @@ src/
 skills/windows-cve-triage/SKILL.md
 ```
 
-The dashboard binds to `127.0.0.1` in stdio mode, and its run endpoint goes through the same tool
-handlers, so the "only writes to its own files" rule holds on the web path too. In `--http` mode the
-same port serves `/mcp` and the dashboard on the public bind address.
+One listener serves the dashboard, `/api/*` and the `/mcp` endpoint, and its run endpoint goes
+through the same tool handlers, so the "only writes to its own files" rule holds on the web path
+too. `--no-web` closes the listener completely; stdio keeps running either way.

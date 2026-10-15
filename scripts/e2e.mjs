@@ -15,7 +15,7 @@ if (argv.includes("--offline")) env.WSMD_OFFLINE = "1";
 
 const transport = new StdioClientTransport({
   command: process.execPath,
-  args: ["dist/index.js"],
+  args: ["dist/index.js", "--no-web"],
   cwd: process.cwd(),
   env,
   stderr: "pipe",

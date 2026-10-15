@@ -17,7 +17,7 @@ const data = (res) => res.structuredContent?.result ?? null;
 async function run({ sampling }) {
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: ["dist/index.js"],
+    args: ["dist/index.js", "--no-web"],
     cwd: process.cwd(),
     env: { ...process.env, WSMD_DATA_DIR: process.env.WSMD_DATA_DIR },
     stderr: "pipe",

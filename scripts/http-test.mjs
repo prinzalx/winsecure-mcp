@@ -1,6 +1,7 @@
 /**
- * Proves the HTTP transport: the server started with --http answers a real MCP session on /mcp and
- * never touches stdio, so a client that connects by url (Hermes) works without spawning node.
+ * Proves the HTTP transport: alongside stdio the server answers a real MCP session on /mcp, so a
+ * client that connects by url (Hermes) works without spawning node. Like winadmin, one listener
+ * carries /api/, /mcp and the dashboard; a bare GET on /mcp is an MCP error (406), not HTML.
  *
  * Usage: node scripts/http-test.mjs [port]
  */
@@ -8,10 +9,12 @@ const port = process.argv[2] ?? "8799";
 const base = `http://127.0.0.1:${port}/mcp`;
 
 const { spawn } = await import("node:child_process");
-const server = spawn(process.execPath, ["dist/index.js", "--http", "--no-web", "--port", port], {
+const server = spawn(process.execPath, ["dist/index.js", "--port", port], {
   cwd: process.cwd(),
   env: { ...process.env, WSMD_DATA_DIR: process.env.WSMD_DATA_DIR ?? ".wsmd-http-test-data" },
-  stdio: ["ignore", "pipe", "pipe"],
+  // stdin must stay open: the server ends when its stdio client closes it, and "ignore" would look
+  // like an immediate close.
+  stdio: ["pipe", "pipe", "pipe"],
 });
 server.stderr.on("data", (c) => process.stderr.write(String(c)));
 
@@ -76,6 +79,13 @@ while (Date.now() - started < 20_000) {
     } }, undefined, `${base}/`);
     if (!slashed.sessionId) throw new Error("/mcp/ did not return a session id");
     console.log(`/mcp/ → ${slashed.contentType.split(";")[0]}, session ${String(slashed.sessionId).slice(0, 8)}`);
+
+    // A bare GET without an Accept header is not a browser and not an MCP client: the transport
+    // must answer its 406 JSON here, exactly like winadmin — never the dashboard HTML.
+    const bare = await fetch(base, { headers: {} });
+    const bareText = await bare.text();
+    if (bare.status !== 406 || !bareText.includes("Not Acceptable")) throw new Error(`bare GET /mcp → HTTP ${String(bare.status)}: ${bareText.slice(0, 80)}`);
+    console.log(`bare GET /mcp → HTTP ${String(bare.status)} ${bareText.slice(0, 80)}`);
     break;
   } catch (cause) {
     if (!up && Date.now() - started > 19_000) throw cause;

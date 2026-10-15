@@ -152,7 +152,12 @@ export const cveTools: ToolDefinition[] = [
       };
       const v31 = scoreOf("cvssMetricV31");
       const v4 = scoreOf("cvssMetricV40");
-      const description = (cve.descriptions ?? []).map((d) => String(d.value ?? "")).join(" ").replace(/\s+/g, " ").trim();
+      // NVD mixes translated ADP descriptions into the list (a Spanish probe showed
+      // “Vulnerabilidad de ejecución remota…”), so the english entry is preferred and only the
+      // first one is kept — joining all of them reads like noise.
+      const descriptions = cve.descriptions ?? [];
+      const english = descriptions.find((d) => String(d.lang ?? "").toLowerCase().startsWith("en"));
+      const description = String((english ?? descriptions[0])?.value ?? "").replace(/\s+/g, " ").trim();
 
       return ok(
         {

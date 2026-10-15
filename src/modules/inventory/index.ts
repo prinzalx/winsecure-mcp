@@ -34,6 +34,8 @@ export const inventoryTools: ToolDefinition[] = [
       ".exe files that carry version information.\n" +
       "A source that fails does not fail the run: its counter comes back 0 with the reason in `source_errors`, and a " +
       "directory the process may not enter is skipped rather than reported.\n" +
+      "Read the counters together with `source_errors`: every source that contributed nothing is reported there, so a " +
+      "host the server cannot see (no powershell.exe, no fixed drive) says so instead of answering \"0 programs\".\n" +
       "The portable walk is the expensive one. It is bounded by portableMaxResults and portableTimeoutMs in the config, " +
       "and when it is cut off the report says so and still lists the paths it visited.",
     input: z.object({
@@ -66,7 +68,14 @@ export const inventoryTools: ToolDefinition[] = [
       }
 
       if (want.has("portable")) {
-        const roots = Array.isArray(args.roots) && args.roots.length > 0 ? args.roots.map(String) : await fixedRoots();
+        let roots: string[] = [];
+        if (Array.isArray(args.roots) && args.roots.length > 0) {
+          roots = args.roots.map(String);
+        } else {
+          const foundRoots = await fixedRoots();
+          roots = foundRoots.roots;
+          if (foundRoots.error) errors.portable_roots = foundRoots.error;
+        }
         const r = await findPortablePrograms({
           roots,
           excludes: settings.portableExcludes,
@@ -87,11 +96,23 @@ export const inventoryTools: ToolDefinition[] = [
         programs.push(...kept);
       }
 
+      // A requested source that contributed nothing is always reported, with or without an
+      // exception behind it. Without this the answer was "scan succeeded, 0 programs" on a machine
+      // where the server could not see Windows at all.
+      for (const source of SOURCES) {
+        if (want.has(source) && (counters[source] ?? 0) === 0 && errors[source] === undefined) {
+          errors[source] = "no entries reported";
+        }
+      }
+
       const store = ctx.store.load();
       const entries = dedupePrograms(programs, store.inventory);
       store.inventory = entries;
       store.updated_at = new Date().toISOString();
       ctx.store.save(store);
+
+      const problemKeys = Object.keys(errors);
+      const counterLine = `registry ${String(counters.registry ?? 0)}, winget ${String(counters.winget ?? 0)}, portable ${String(counters.portable ?? 0)}`;
 
       return ok(
         {
@@ -100,11 +121,16 @@ export const inventoryTools: ToolDefinition[] = [
           counters,
           deduplicated: entries.length,
           duplicates_merged: Math.max(0, programs.length - entries.length),
-          source_errors: Object.keys(errors).length > 0 ? errors : undefined,
+          /** Set when a source that was asked for contributed nothing; the scan is then degraded, not clean. */
+          degraded: problemKeys.length > 0,
+          source_errors: problemKeys.length > 0 ? errors : undefined,
           report,
           stored_in: ctx.store.path,
         },
-        `${String(entries.length)} programs after deduplication (registry ${String(counters.registry ?? 0)}, winget ${String(counters.winget ?? 0)}, portable ${String(counters.portable ?? 0)}).`,
+        `${String(entries.length)} programs after deduplication (${counterLine}).` +
+          (problemKeys.length > 0
+            ? ` Degraded: ${problemKeys.map((k) => `${k}: ${errors[k]}`).join("; ")}`
+            : ""),
       );
     },
   },

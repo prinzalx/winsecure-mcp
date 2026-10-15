@@ -61,6 +61,13 @@ export async function readRegistryPrograms(timeoutMs = 60_000): Promise<{ progra
       uninstall_string: String(row.UninstallString ?? "").trim() || null,
     });
   }
+
+  // Reading all four Uninstall keys without a single DisplayName is not a plausible result on a
+  // working Windows host; it means the process could not see the registry at all. Saying so keeps a
+  // silent failure from looking like a clean "0 programs".
+  if (programs.length === 0) {
+    return { programs, error: "no DisplayName entries found under the four Uninstall keys" };
+  }
   return { programs };
 }
 
@@ -236,12 +243,23 @@ export async function findPortablePrograms(options: {
   };
 }
 
-/** Drive letters that are worth walking: fixed disks only, so network and removable drives stay out by default. */
-export async function fixedRoots(timeoutMs = 30_000): Promise<string[]> {
+/**
+ * Drive letters that are worth walking: fixed disks only, so network and removable drives stay out
+ * by default.
+ *
+ * The answer is reported rather than swallowed: an empty list means the host exposed no fixed disk,
+ * which is the case a probe must be able to distinguish from "walked the disks, found nothing".
+ */
+export async function fixedRoots(timeoutMs = 30_000): Promise<{ roots: string[]; error?: string }> {
   const script =
     "Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction SilentlyContinue | " +
     "Where-Object { $_.DriveType -eq 3 } | ForEach-Object { $_.DeviceID }";
   const res = await runPowerShell<string>(script, { timeoutMs });
-  if (!res.ok) return ["C:\\"];
-  return asArray<string>(res.data).map((d) => `${String(d).replace(/\\+$/, "")}\\`);
+  if (!res.ok) {
+    return { roots: ["C:\\\\"], error: `${res.error ?? "drive query failed"} — falling back to C:\\` };
+  }
+  const roots = asArray<string>(res.data).map((d) => `${String(d).replace(/\\+$/, "")}\\\\`);
+  return roots.length > 0
+    ? { roots }
+    : { roots: ["C:\\\\"], error: "Win32_LogicalDisk reported no fixed drive — falling back to C:\\" };
 }

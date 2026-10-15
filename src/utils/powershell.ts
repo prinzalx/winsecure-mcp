@@ -132,6 +132,21 @@ export async function runPowerShell<T = unknown>(
     const stderr = err.stderr ?? "";
     const timedOut = Boolean(err.killed) || err.code === "ETIMEDOUT";
 
+    // A missing powershell.exe (WSL without the interpreter, a minimal container) produces exactly
+    // the empty stdout/stderr the "no rows" branch below would happily read as success. Reported as
+    // an error here, so a scan says "I cannot see Windows" instead of "0 programs".
+    if (err.code === "ENOENT") {
+      return {
+        ok: false,
+        data: null,
+        exitCode: null,
+        stdout,
+        stderr,
+        durationMs: Date.now() - startedAt,
+        error: `${POWERSHELL} not found — this host does not offer Windows PowerShell`,
+      };
+    }
+
     // A cmdlet whose errors were suppressed still leaves `$?` false, which makes powershell.exe
     // exit non-zero even though the query simply came back empty. Empty output and empty stderr is
     // therefore the "no rows" case, not a failure.

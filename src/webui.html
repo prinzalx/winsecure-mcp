@@ -242,7 +242,7 @@
           )
           .join("");
 
-        $("#footer").textContent = `data: ${state.data_dir} · store: ${state.store_path} · server time ${state.server_time}`;
+        $("#footer").textContent = `v${state.version} · data: ${state.data_dir} · store: ${state.store_path} · server time ${state.server_time}`;
       }
 
       async function refresh() {

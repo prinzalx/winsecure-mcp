@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { normName, normVersion, dedupKey, compareVersions, similarity, severityBand } from "../dist/utils/matching.js";
+import { normName, normVersion, dedupKey, compareVersions, similarity, severityBand, productFamily } from "../dist/utils/matching.js";
 
 test("normName drops arch and locale markers", () => {
   assert.equal(normName("Example Toolbar (x64)"), "example toolbar");
@@ -51,6 +51,14 @@ test("similarity is 1 for equal names and degrades with distance", () => {
   assert.ok(similarity("Notepad++", "VLC media player") < 0.88);
   assert.ok(similarity("Notepad++", "Paint") < 0.88);
   assert.equal(similarity("", "anything"), 0);
+});
+
+test("productFamily cuts everything behind a version token", () => {
+  assert.equal(productFamily("Microsoft Edge WebView2 Runtime 155.0.4283.45"), productFamily("Microsoft Edge WebView2 Runtime 152.0.4191.53"));
+  assert.equal(productFamily("Microsoft Edge 155.0.4283.45"), "microsoft edge");
+  // A name without a version stays a family of its own and never swallows a different product.
+  assert.notEqual(productFamily("Git"), productFamily("7-Zip"));
+  assert.equal(productFamily(null), "");
 });
 
 test("severityBand maps scores to english labels", () => {

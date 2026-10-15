@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import type { ToolDefinition } from "../../types.js";
 import { fail, ok } from "../../utils/result.js";
-import { ASSESSMENT_PROMPT_RULES, ASSESSMENT_SCHEMA, buildEvidence, normalizeAssessment, severityRank } from "./todo.js";
+import { ASSESSMENT_PROMPT_RULES, ASSESSMENT_SCHEMA, buildEvidence, compareTodoRank, normalizeAssessment } from "./todo.js";
 import type { Todo } from "../../model.js";
 
 const CONFIDENCES = ["exact", "high", "medium", "low"] as const;
@@ -17,7 +17,11 @@ function summarize(todos: Todo[]): string {
       // A todo whose hits could not be version-checked says so, so the reader never mistakes a name
       // match for a confirmed vulnerability.
       const marks = t.unconfirmed_cves?.length ? `unconfirmed:${String(t.unconfirmed_cves.length)}` : "-";
-      return `${t.id}  ${flag}  ${t.max_severity.padEnd(8)}  cvss ${fmt(t.max_cvss)}  epss ${fmt(t.max_epss)}  ${String(t.cves.length).padStart(3)} CVE  ${t.match_confidence.padEnd(6)}  ${marks.padEnd(13)}  ${t.status}  ${t.program} ${t.version ?? ""}`;
+      // Several installed versions of one product share a row; the members are named so nothing is hidden.
+      const versions = t.versions?.length
+        ? `${t.version ?? "?"} (+${String(t.versions.length - 1)}: ${t.versions.map((v) => v.version ?? "?").join(", ")})`
+        : `${t.version ?? ""}`;
+      return `${t.id}  ${flag}  ${t.max_severity.padEnd(8)}  cvss ${fmt(t.max_cvss)}  epss ${fmt(t.max_epss)}  ${String(t.cves.length).padStart(3)} CVE  ${t.match_confidence.padEnd(6)}  ${marks.padEnd(13)}  ${t.status}  ${t.program} ${versions}`;
     })
     .join("\n");
 }
@@ -36,12 +40,12 @@ export const todoTools: ToolDefinition[] = [
     module: "todos",
     title: "List to-dos",
     description:
-      "The CVE to-do list, sorted KEV first, then severity, then EPSS. Filterable by status.",
+      "The CVE to-do list, sorted confirmed-KEV first, then confirmed findings, then severity/EPSS. Filterable by status.",
     docs:
       "The list the human works from. Every entry names the program, its version, how many CVEs back it, whether CISA " +
       "KEV marks it as actively exploited, and the assessment status.\n" +
-      "Sort order is deliberate: an actively exploited finding outranks a merely high CVSS, because that is the signal " +
-      "that says patch this one first.\n" +
+      "Sort order is deliberate: a verified actively-exploited finding outranks every merely unverified name match, " +
+      "because an unconfirmed KEV hit must never headline the list. Within that, severity and EPSS order the work.\n" +
       "An empty list after check_cves is an answer, not a failure: it means no CVE matched the installed programs.",
     input: z.object({
       status: z.enum(["open", "assessed", "dismissed", "all"]).optional().describe("Filter by status. Defaults to all non-dismissed"),
@@ -60,14 +64,7 @@ export const todoTools: ToolDefinition[] = [
       }
       if (args.kev_only === true) todos = todos.filter((t) => t.any_kev);
 
-      todos = [...todos].sort(
-        (a, b) =>
-          Number(b.any_kev) - Number(a.any_kev) ||
-          severityRank(b.max_severity) - severityRank(a.max_severity) ||
-          (b.max_cvss ?? 0) - (a.max_cvss ?? 0) ||
-          (b.max_epss ?? 0) - (a.max_epss ?? 0) ||
-          a.program.localeCompare(b.program, "en"),
-      );
+      todos = [...todos].sort(compareTodoRank);
 
       const limit = typeof args.limit === "number" ? args.limit : 40;
       const shown = todos.slice(0, limit);

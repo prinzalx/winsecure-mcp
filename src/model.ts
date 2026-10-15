@@ -23,6 +23,12 @@ export interface RawProgram {
   /** Registry hive/key the entry came from. */
   registry_key: string | null;
   uninstall_string: string | null;
+  /**
+   * Set by the portable walk for a `*installer*.exe` / `*setup*.exe` file outside Program Files.
+   * Such a file is archive residue (a downloaded setup sitting in a document folder), not an
+   * installed program, so it never becomes a security to-do.
+   */
+  installer_artifact?: boolean;
 }
 
 /** One contribution to a deduplicated program. */
@@ -36,6 +42,8 @@ export interface ProgramSource {
   registry_key: string | null;
   install_source: string | null;
   uninstall_string?: string | null;
+  /** See {@link RawProgram.installer_artifact}. */
+  installer_artifact?: boolean;
 }
 
 /** The deduplicated program: the unit the CVE check works on. */
@@ -50,6 +58,11 @@ export interface InventoryEntry {
   paths: string[];
   /** Highest-confidence match wins when a later CVE check needs one identity. */
   match_hint: string | null;
+  /**
+   * True when *only* installer archives reported this program. `check_cves` skips such entries:
+   * an `npp.7.5.4.Installer.exe` in a document folder is not an installed program.
+   */
+  installer_artifact?: boolean;
   first_seen: string;
   last_seen: string;
 }
@@ -108,6 +121,13 @@ export interface Assessment {
   assessed_at: string;
 }
 
+/** One installed version inside a product-family to-do (see {@link Todo.versions}). */
+export interface TodoVersion {
+  inventory_id: string;
+  program: string;
+  version: string | null;
+}
+
 export interface Todo {
   id: string;
   inventory_id: string;
@@ -124,6 +144,16 @@ export interface Todo {
   max_severity: "none" | "low" | "medium" | "high" | "critical";
   max_cvss: number | null;
   any_kev: boolean;
+  /**
+   * At least one KEV hit has a **verified** version. `list_todos` sorts on this, so an entry whose
+   * only KEV signal is an unverified name match never outranks a confirmed finding.
+   */
+  kev_confirmed: boolean;
+  /**
+   * Set when several installed versions of the same product were merged into this one to-do: every
+   * member version, newest first. Without it the to-do came from a single inventory entry.
+   */
+  versions?: TodoVersion[];
   max_epss: number | null;
   /** The newest `fixed_version` across the hits, when one is known. */
   fix_version: string | null;

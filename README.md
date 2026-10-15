@@ -38,12 +38,13 @@ client such as Hermes it does not own a console: stdout carries the protocol and
 client's log instead.
 
 ```
-█     █ ███ █   █ █████ █████  ████ █   █ ████  █████
-█     █  █  ██  █ █     █     █     █   █ █   █ █
-█  █  █  █  █ █ █  ███  ████  █     █   █ ████  ████
-█ █ █ █  █  █  ██     █ █     █     █   █ █ █   █
- ██ ██  ███ █   █ █████ █████  ████  ███  █  ██ █████
-  version         v0.4.0
+██╗    ██╗██╗███╗   ██╗███████╗███████╗ ██████╗██╗   ██╗██████╗ ███████╗   ███╗   ███╗ ██████╗██████╗
+██║    ██║██║████╗  ██║██╔════╝██╔════╝██╔════╝██║   ██║██╔══██╗██╔════╝   ████╗ ████║██╔════╝██╔══██╗
+██║ █╗ ██║██║██╔██╗ ██║███████╗█████╗  ██║     ██║   ██║██████╔╝█████╗     ██╔████╔██║██║     ██████╔╝
+██║███╗██║██║██║╚██╗██║╚════██║██╔══╝  ██║     ██║   ██║██╔══██╗██╔══╝     ██║╚██╔╝██║██║     ██╔═══╝
+╚███╔███╔╝██║██║ ╚████║███████║███████╗╚██████╗╚██████╔╝██║  ██║███████╗   ██║ ╚═╝ ██║╚██████╗██║
+ ╚══╝╚══╝ ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝   ╚═╝     ╚═╝ ╚═════╝╚═╝
+  version         v0.5.0
   data directory  C:\Users\<user>\AppData\Roaming\winsecure-mcp
   store file      C:\Users\<user>\AppData\Roaming\winsecure-mcp\winsecure.json
   web interface   http://0.0.0.0:8788
@@ -51,7 +52,7 @@ client's log instead.
 ```
 
 Open <http://127.0.0.1:8788> in a browser for the **web dashboard**: inventory and to-do statistics,
-the severity breakdown, the top risks KEV-first, an activity log of every call this server session
+the severity breakdown, the top risks confirmed-KEV-first, an activity log of every call this server session
 answered, and the eight tools with their full docs. Its two buttons run `scan_inventory` and
 `check_cves` through the same handlers an agent calls, so the page can never disagree with a tool
 answer. `--no-web` (or `WSMD_NO_WEB=1`) keeps it stdio-only; `--port` / `WSMD_PORT` move it off 8788.
@@ -87,7 +88,7 @@ connecting by `url:` is the intended setup on such a host.
 |---|---|
 | `scan_inventory` | Refresh the inventory (sources selectable); returns per-source counters + the dedup result |
 | `check_cves` | Match the inventory against the CVE sources; fill/refresh the to-do list |
-| `list_todos` | Sorted KEV first, then severity/EPSS; filterable by status |
+| `list_todos` | Sorted confirmed-KEV first, then confirmed findings, then severity/EPSS; filterable by status |
 | `assess_todo` | Effort assessment for one entry (sampling client → verdict; else evidence package) |
 | `save_assessment` | Write the assessment back (the non-sampling path) |
 | `get_program` | Detail view of one finding (sources, paths, versions, assigned CVEs) |
@@ -185,11 +186,18 @@ node scripts/banner.mjs  # regenerate the console logo
 
 ```
 scan_inventory → 357 programs after dedup (registry 205, winget 209, portable 40 cut at max)
-check_cves     → 10 CVE hits on 6 programs, 10 actively exploited; cvelist index 1991 CVEs / 1169 products
-list_todos     → WhatsApp (KEV, EPSS 0.68), Microsoft Edge (×2, KEV, EPSS 0.83), 7-Zip, Git, Notepad++
+check_cves     → cvelist index 1991 CVEs / 1169 products (0.7 % coverage, cold-start phase)
+list_todos     → the v0.5.0 verdict rules turned this run's 6 false positives into zero to-dos
 assess_todo    → evidence package returned (client cannot sample); saved via save_assessment
 cve_detail     → CVE-2024-21412: CVSS 8.1 — Internet Shortcut Files Security Feature Bypass
 ```
+
+The live beta (v0.4.0) produced six to-dos on this host and **all six were unconfirmed name
+matches, none an actual exposure**: two Edge versions matched the same two 2016 EdgeHTML CVEs as
+two separate rows, WhatsApp 2.2639 a 2019 CVE, Git 2.55 a CVE affecting Git < 2.50.1, 7-Zip 26.02 a
+CVE affecting < 24.07, and Notepad++ 7.54 came from two installer `.exe` files in document folders.
+After the v0.5.0 verdict rules the same run reports `0 CVE hit(s) ... 8 name match(es) rejected by
+the version verdict`, i.e. no to-do for Edge, WhatsApp, Git or 7-Zip.
 
 Offline test (`WSMD_OFFLINE=1`, cold cache): inventory 357 programs, `cve_status: "unknown"`,
 `source_errors: ["offline","offline"]`, no failures.
@@ -199,19 +207,37 @@ A second probe ran the server in a Linux (WSL) sandbox where neither `powershell
 see now reports `degraded: true`, names every source that contributed nothing (missing interpreter,
 no fixed drive) and adds the `environment` block, instead of claiming a clean "0 programs".
 
-## Matching Honesty (v0.3.0)
+## Matching Honesty (v0.3.0, verdict rules extended in v0.5.0)
 
-Two rules keep the hit list trustworthy, both of them visible in the answer rather than buried:
+Rules that keep the hit list trustworthy, all of them visible in the answer rather than buried:
 
 - **A KEV product-name match is version-checked.** The KEV feed carries no version range, so the hit
   is verified against the local CVE record: outside the affected range it is **dropped** (Chrome
   120 hit `CVE-2020-16017`, which NVD limits to Chrome *prior to 86.0.4240.198*), and when no range
   can be evaluated the hit is kept **unconfirmed** — `match_confidence: "low"`, listed in
   `unconfirmed_cves`, and it does not lift `max_severity`. `check_cves` counts them separately.
+- **A name-only match must also be plausible for its era (v0.5.0).** The delta index only ever
+  accumulates recent CVEs, so an old CVE (a 2016 EdgeHTML bug, a 2019 WhatsApp bug) may never get
+  local range data at all. When a KEV name match has no range that confirmed it **and** the
+  installed version's era sits clearly above the CVE's publication year, the pair is impossible on
+  its face and drops before it can become a to-do. Everything the verdict rejected counts up as
+  `dropped_by_verdict`, so the filtering is visible instead of silent.
+- **Several installed versions of one product are ONE to-do (v0.5.0).** Edge 152 and Edge 155 are
+  the same finding: the to-do represents the newest version and lists the members in `versions`, so
+  the list has no near-duplicate rows per version.
+- **An installer archive is not installed software (v0.5.0).** A `*installer*.exe` / `*setup*.exe`
+  the portable walk found outside Program Files is tagged `installer_artifact` (a downloaded setup in
+  a document folder); if no other source reported the program, `check_cves` skips it
+  (`installer_artifacts_skipped`).
 - **A KEV hit is never rendered `severity: "none"` as if that were a fact.** Whatever the local index
   does not score is completed from the disk-cached NVD helper before the to-do is built
-  (`nvd_enriched` in the answer), and a hit that stays unscored carries `cvss_source:
-  "nvd_unreachable"` / `"nvd_no_score"` so hit level and to-do level cannot disagree.
+  (`nvd_enriched` in the answer), and **one NVD answer is applied to every hit object of that CVE
+  id** (v0.5.0 — the live beta saw the same CVE scored on one to-do and null on another). A hit that
+  stays unscored carries `cvss_source: "nvd_unreachable"` / `"nvd_no_score"` so hit level and to-do
+  level cannot disagree.
+- **Ranking never puts an unverified hit above a confirmed one (v0.5.0).** `list_todos` and the
+  dashboard sort verified-KEV first, then any confirmed finding, then severity/CVSS/EPSS — an
+  entry whose only KEV signal is an unconfirmed name match cannot headline the list.
 
 ### Registration in Hermes
 

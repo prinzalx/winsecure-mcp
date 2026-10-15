@@ -244,6 +244,7 @@ export async function findPortablePrograms(options: {
   const programs = found.map((row) => {
     const product = String(row.Product ?? "").trim();
     const version = String(row.ProductVersion ?? "").trim();
+    const path = String(row.File ?? "") || null;
     return {
       source: "portable" as const,
       name: product === "" ? "unknown" : product,
@@ -251,9 +252,10 @@ export async function findPortablePrograms(options: {
       publisher: String(row.Company ?? "").trim() || null,
       install_source: null,
       package_id: null,
-      path: String(row.File ?? "") || null,
+      path,
       registry_key: null,
       uninstall_string: null,
+      ...(isInstallerArtifact(path) ? { installer_artifact: true } : {}),
     };
   });
 
@@ -265,6 +267,22 @@ export async function findPortablePrograms(options: {
     skipped_paths: skipped.slice(0, 40),
     timedOut,
   };
+}
+
+/**
+ * Whether a portable `.exe` is a downloaded installer rather than an installed program.
+ *
+ * The live beta found Notepad++ 7.54 twice from `npp.7.5.4.Installer.exe` files sitting in document
+ * folders: archive residue of a download, with no registry key and no uninstall string behind it.
+ * A `*installer*.exe` / `*setup*.exe` outside Program Files is tagged `installer_artifact` and never
+ * becomes a security to-do; inside Program Files an installer may legitimately be the install
+ * itself, so the tag stays off there.
+ */
+export function isInstallerArtifact(path: string | null): boolean {
+  if (path === null) return false;
+  if (/program\sfiles/i.test(path)) return false;
+  const file = path.split(/[\\/]/).pop() ?? "";
+  return /\.(exe)$/i.test(file) && /(installer|setup)/i.test(file);
 }
 
 /**

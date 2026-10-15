@@ -1,7 +1,8 @@
 import type { TodoFile } from "./store.js";
 import type { ToolDefinition } from "./types.js";
 import type { Todo } from "./model.js";
-import { severityRank } from "./modules/todos/todo.js";
+import { compareTodoRank } from "./modules/todos/todo.js";
+import type { TodoVersion } from "./model.js";
 
 /**
  * One remembered tool call.
@@ -81,6 +82,8 @@ export interface DashboardTodoRow {
   cve_count: number;
   /** CVE ids carried for the record whose version could not be verified. */
   unconfirmed_count: number;
+  /** Every installed version merged into this row, newest first (a product-family to-do). */
+  versions: TodoVersion[] | null;
   max_severity: Todo["max_severity"];
   max_cvss: number | null;
   max_epss: number | null;
@@ -100,6 +103,7 @@ function todoRow(t: Todo): DashboardTodoRow {
     version: t.version,
     cve_count: t.cves.length,
     unconfirmed_count: t.unconfirmed_cves?.length ?? 0,
+    versions: t.versions?.length ? t.versions : null,
     max_severity: t.max_severity,
     max_cvss: t.max_cvss,
     max_epss: t.max_epss,
@@ -157,16 +161,7 @@ export function computeState(options: {
   }
 
   // Same order list_todos uses, so the dashboard cards and the tool answer agree.
-  const top = [...active]
-    .sort(
-      (a, b) =>
-        Number(b.any_kev) - Number(a.any_kev) ||
-        severityRank(b.max_severity) - severityRank(a.max_severity) ||
-        (b.max_cvss ?? 0) - (a.max_cvss ?? 0) ||
-        (b.max_epss ?? 0) - (a.max_epss ?? 0) ||
-        a.program.localeCompare(b.program, "en"),
-    )
-    .slice(0, 10)
+  const top = [...active].sort(compareTodoRank).slice(0, 10)
     .map(todoRow);
 
   return {

@@ -21,6 +21,9 @@ export function dedupePrograms(programs: RawProgram[], previous: InventoryEntry[
 
     const existing = byKey.get(key);
     if (existing) {
+      // Only an entry *every* source reported as an installer archive stays an archive; a registry
+      // or winget hit proves the program is really installed.
+      existing.installer_artifact = existing.installer_artifact === true && p.installer_artifact === true;
       if (!existing.sources.some((s) => s.source === p.source && s.name === p.name && s.version === (p.version ?? ""))) {
         existing.sources.push(toSource(p));
       }
@@ -41,6 +44,7 @@ export function dedupePrograms(programs: RawProgram[], previous: InventoryEntry[
       package_ids: p.package_id ? [p.package_id] : [],
       paths: p.path ? [p.path] : [],
       match_hint: null,
+      ...(p.installer_artifact === true ? { installer_artifact: true } : {}),
       first_seen: before?.first_seen ?? now,
       last_seen: now,
     });
@@ -66,6 +70,7 @@ function toSource(p: RawProgram): ProgramSource {
     registry_key: p.registry_key,
     install_source: p.install_source,
     uninstall_string: p.uninstall_string,
+    ...(p.installer_artifact === true ? { installer_artifact: true } : {}),
   };
 }
 

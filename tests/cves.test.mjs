@@ -3,7 +3,8 @@ import { test } from "node:test";
 
 import { normName } from "../dist/utils/matching.js";
 import { kevForProduct } from "../dist/modules/cves/feeds.js";
-import { candidates, versionAffected, matchProgram } from "../dist/modules/cves/engine.js";
+import { candidates, versionAffected, matchProgram, eraImplausible } from "../dist/modules/cves/engine.js";
+import { enrichKevHits } from "../dist/modules/cves/index.js";
 
 function kevIndex(rows) {
   const byProduct = new Map();
@@ -59,6 +60,36 @@ test("matchProgram reports checked=false when no CVE data is loaded", () => {
   const res = matchProgram(entry, emptyIndex, kevIndex([]));
   assert.equal(res.checked, false);
   assert.deepEqual(res.hits, []);
+});
+
+test("eraImplausible drops the obviously impossible name matches", () => {
+  // The live beta's four false positives, from the report of 10/2026.
+  assert.equal(eraImplausible("155.0.4283.45", "2016-10-11T00:00:00Z"), true, "EdgeHTML bug vs. Edge 155");
+  assert.equal(eraImplausible("2.2639.100.0", "2019-01-01T00:00:00Z"), true, "2019 WhatsApp bug vs. a current build");
+  // A 2025 CVE against 7-Zip 26.02 stays plausibly kept; its real exclusion comes with the range.
+  assert.equal(eraImplausible("26.02", "2025-01-01T00:00:00Z"), false);
+  // No publication date means no era verdict, which keeps the (unconfirmed) hit.
+  assert.equal(eraImplausible("155.0.4283.45", null), false);
+  assert.equal(eraImplausible(null, "2016-10-11T00:00:00Z"), false);
+});
+
+test("a KEV name match the era heuristic rejects is dropped and counted", () => {
+  const entry = { id: "x", name: "Microsoft Edge", version: "155.0.4283.45", publisher: null, sources: [], package_ids: [], paths: [], match_hint: null, first_seen: "", last_seen: "" };
+  const index = { byProduct: new Map(), byCve: new Map(), totalCves: 1, products: 0, fetched_at: null, from: "cache" };
+  const kev = kevIndex([kevRow("CVE-2016-7200", "Microsoft Edge")]);
+  const { hits, dropped } = matchProgram(entry, index, kev);
+  assert.deepEqual(hits, [], "a 2016 CVE must not headline Edge 155");
+  assert.equal(dropped, 1);
+});
+
+test("a range that excludes the installed version is a counted not_affected verdict", () => {
+  const entry = { id: "x", name: "Git", version: "2.55.0.3", publisher: null, sources: [], package_ids: [], paths: [], match_hint: null, first_seen: "", last_seen: "" };
+  const record = { cve_id: "CVE-2025-48384", product: "git", vendor: null, summary: null, published: "2025-10-01T00:00:00Z", cvss: 8, range_from: null, range_below: "2.50.1", fixed_version: "2.50.1" };
+  const index = { byProduct: new Map([[normName("git"), [record]]]), byCve: new Map([["CVE-2025-48384", record]]), totalCves: 1, products: 1, fetched_at: null, from: "cache" };
+  const kev = kevIndex([kevRow("CVE-2025-48384", "Git")]);
+  const { hits, dropped } = matchProgram(entry, index, kev);
+  assert.deepEqual(hits, []);
+  assert.equal(dropped, 1, "installed 2.55.0.3 is above the affected range, so the pair is impossible");
 });
 
 test("matchProgram marks the product-index hit and lets KEV flag exploitation", () => {
@@ -124,6 +155,42 @@ test("an unverifiable KEV range is kept as a low-confidence unconfirmed hit", ()
   assert.equal(hits.length, 1);
   assert.equal(hits[0].unconfirmed, true);
   assert.equal(hits[0].match_confidence, "low");
+});
+
+test("enrichKevHits applies one NVD answer to every hit object of that CVE id", async () => {
+  // The live beta showed the same CVE enriched on one Edge to-do (8.8) and null on the other: the
+  // old loop enriched only the first hit object per id. Both objects must carry the score now.
+  const kevHit = (over = {}) => ({
+    cve_id: "CVE-2016-7201", cvss: null, severity: "none", kev: true, kev_due_date: null, epss: null,
+    fixed_version: null, matched_by: "kev_product", match_confidence: "low", summary: null, published: null, ...over,
+  });
+  const a = kevHit();
+  const b = kevHit();
+  let calls = 0;
+  const ctx = {
+    config: { settings: { httpTimeoutMs: 1000 } },
+    http: {
+      get: async () => {
+        calls += 1;
+        return {
+          body: JSON.stringify({ vulnerabilities: [{ cve: {
+            published: "2016-11-01T00:00:00Z",
+            descriptions: [{ lang: "en", value: "Edge memory corruption" }],
+            metrics: { cvssMetricV31: [{ cvssData: { baseScore: 8.8 } }] },
+          } }] }),
+          from: "cache",
+          fetched_at: null,
+        };
+      },
+    },
+  };
+  const enriched = await enrichKevHits(ctx, [a, b]);
+  assert.equal(enriched, 1, "one CVE, one lookup, counted once");
+  assert.equal(calls, 1, "each CVE id is fetched at most once per run");
+  assert.equal(a.cvss, 8.8);
+  assert.equal(b.cvss, 8.8, "the duplicate object of the same CVE id must not stay null");
+  assert.equal(b.severity, "high");
+  assert.equal(b.cvss_source, "nvd");
 });
 
 test("a KEV-only hit is enriched from the local index by CVE id", () => {

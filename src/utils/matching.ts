@@ -74,6 +74,19 @@ export function normVersion(value: string | null | undefined): string {
   return squeeze(s);
 }
 
+/**
+ * The product family of a display name: everything behind a version-like token is dropped.
+ *
+ * "Microsoft Edge WebView2 Runtime 155.0.4283.45" and "Microsoft Edge 152.0.4191.53" both reduce to
+ * "microsoft edge", which lets `check_cves` group several installed versions of the same product into
+ * one to-do instead of printing a near-duplicate row per version.
+ */
+export function productFamily(value: string | null | undefined): string {
+  const s = squeeze(String(value ?? "").toLowerCase());
+  const cut = s.search(/\d+(?:\.\d+)+|\s\d{2,}(?:\s|$)/);
+  return normName(cut < 0 ? s : s.slice(0, cut));
+}
+
 /** The key that unifies the same program found by several sources. */
 export function dedupKey(name: string | null | undefined, version: string | null | undefined): string {
   return `${normName(name)}|${normVersion(version)}`;

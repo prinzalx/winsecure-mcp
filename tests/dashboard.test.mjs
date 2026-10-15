@@ -10,6 +10,8 @@ function todo(id, over = {}) {
     program: `Program ${id}`,
     version: "1.0",
     publisher: null,
+    unconfirmed_cves: [],
+    kev_confirmed: false,
     cves: [{ cve_id: `CVE-2024-000${id}`, cvss: 7, severity: "high", kev: false, kev_due_date: null, epss: null, fixed_version: null, matched_by: "cvelist_product", match_confidence: "high", summary: null, published: null }],
     max_severity: "high",
     max_cvss: 7,
@@ -86,12 +88,19 @@ test("computeState aggregates todo statuses, KEV and severity bands", () => {
   assert.equal(s.todos.assessed_share, 33);
 });
 
-test("computeState orders the top risks KEV first, then severity", () => {
+test("computeState orders the top risks confirmed-KEV first, then severity", () => {
   const s = state({
     inventory: [],
-    todos: [todo("plain"), todo("kev", { any_kev: true, max_severity: "medium" }), todo("crit", { max_severity: "critical" })],
+    todos: [
+      todo("plain"),
+      todo("kev", { any_kev: true, kev_confirmed: true, max_severity: "medium", cves: [{ cve_id: "CVE-2024-000kev", cvss: 6, severity: "medium", kev: true, kev_due_date: null, epss: null, fixed_version: null, matched_by: "kev_product", match_confidence: "medium", summary: null, published: null }] }),
+      // A KEV marker with no verified hit behind it must not outrank a confirmed finding.
+      todo("kev-unverified", { any_kev: true, max_severity: "none", max_cvss: null, unconfirmed_cves: ["CVE-2024-000u"], cves: [{ cve_id: "CVE-2024-000u", cvss: 9.8, severity: "critical", kev: true, kev_due_date: null, epss: null, fixed_version: null, matched_by: "kev_product", match_confidence: "low", summary: null, published: null, unconfirmed: true }] }),
+      todo("crit", { max_severity: "critical" }),
+    ],
   });
-  assert.deepEqual(s.todos.top.map((t) => t.id), ["kev", "crit", "plain"]);
+  assert.deepEqual(s.todos.top.map((t) => t.id), ["kev", "crit", "plain", "kev-unverified"]);
+  assert.equal(s.todos.with_unconfirmed, 1);
 });
 
 test("an empty store yields zeroed statistics and no top rows — empty is not an error", () => {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { buildTodo, mergeTodo, normalizeAssessment, severityRank, buildEvidence, todoId } from "../dist/modules/todos/todo.js";
+import { buildTodo, mergeTodo, normalizeAssessment, severityRank, buildEvidence, todoId, compareTodoRank, groupMatchesIntoTodos, ratingConfidence } from "../dist/modules/todos/todo.js";
 import { parseJsonObject } from "../dist/modules/todos/index.js";
 
 function hit(cveId, over = {}) {
@@ -76,6 +76,40 @@ test("buildTodo keeps an unconfirmed KEV match out of the severity rating", () =
   assert.equal(mixed.max_cvss, 9);
 });
 
+test("groupMatchesIntoTodos merges versions of one product family into one todo", () => {
+  const base = { publisher: null, sources: [], package_ids: [], paths: [], match_hint: null, first_seen: "", last_seen: "" };
+  const edge152 = { id: "inv-152", name: "Microsoft Edge", version: "152.0.4191.53", ...base };
+  const edge155 = { id: "inv-155", name: "Microsoft Edge", version: "155.0.4283.45", ...base };
+  const kevHit = { cve_id: "CVE-2016-7200", cvss: 8.8, severity: "high", kev: true, kev_due_date: null, epss: null, fixed_version: null, matched_by: "kev_product", match_confidence: "low", summary: null, published: null, unconfirmed: true };
+  const todos = groupMatchesIntoTodos([
+    { family: "microsoft edge", entry: edge152, hits: [kevHit], cveStatus: "checked" },
+    { family: "microsoft edge", entry: edge155, hits: [{ ...kevHit }], cveStatus: "checked" },
+  ]);
+  assert.equal(todos.length, 1, "the two Edge versions must share one to-do");
+  assert.equal(todos[0].version, "155.0.4283.45", "the newest version represents the group");
+  assert.deepEqual(todos[0].versions.map((v) => v.version), ["155.0.4283.45", "152.0.4191.53"], "members newest first");
+  assert.equal(todos[0].cves.length, 1, "one row per CVE, not one per version");
+});
+
+test("an entry without a family stays its own todo and carries no versions list", () => {
+  const base = { publisher: null, sources: [], package_ids: [], paths: [], match_hint: null, first_seen: "", last_seen: "" };
+  const only = { id: "inv-1", name: "Obscure", version: null, ...base };
+  const hit = { cve_id: "CVE-2026-1", cvss: null, severity: "none", kev: true, kev_due_date: null, epss: null, fixed_version: null, matched_by: "kev_product", match_confidence: "low", summary: null, published: null, unconfirmed: true };
+  const todos = groupMatchesIntoTodos([{ family: "", entry: only, hits: [hit], cveStatus: "checked" }]);
+  assert.equal(todos.length, 1);
+  assert.equal(todos[0].versions, undefined);
+  assert.equal(ratingConfidence([hit]), "low");
+});
+
+test("compareTodoRank never lets an unconfirmed KEV hit outrank a confirmed finding", () => {
+  const base = { id: "x", name: "P", version: "1.0", publisher: null, sources: [], package_ids: [], paths: [], match_hint: null, first_seen: "", last_seen: "" };
+  const unconfirmed = buildTodo(base, [hit("CVE-U", { cvss: 9.8, kev: true, unconfirmed: true })], "low", "checked");
+  const confirmedKev = buildTodo(base, [hit("CVE-K", { cvss: 6, kev: true })], "high", "checked");
+  const confirmedPlain = buildTodo(base, [hit("CVE-C", { cvss: 8.9 })], "high", "checked");
+  const sorted = [unconfirmed, confirmedPlain, confirmedKev].sort(compareTodoRank);
+  assert.deepEqual(sorted.map((t) => t.cves[0].cve_id), ["CVE-K", "CVE-C", "CVE-U"]);
+});
+
 test("todoId is stable for the same facts and changes with a new CVE set", () => {
   const a = todoId("abc", ["CVE-2", "CVE-1"]);
   assert.equal(a, todoId("abc", ["CVE-1", "CVE-2"]));
@@ -112,12 +146,7 @@ test("list_todos puts KEV first, then severity, then CVSS", () => {
     buildTodo(entry, [hit("CVE-2", { cvss: 9.8, kev: true })], "high", "checked"),
     buildTodo(entry, [hit("CVE-3", { cvss: 7 })], "high", "checked"),
   ];
-  const sorted = [...rows].sort(
-    (a, b) =>
-      Number(b.any_kev) - Number(a.any_kev) ||
-      severityRank(b.max_severity) - severityRank(a.max_severity) ||
-      (b.max_cvss ?? 0) - (a.max_cvss ?? 0),
-  );
+  const sorted = [...rows].sort(compareTodoRank);
   assert.deepEqual(sorted.map((t) => t.cves[0].cve_id), ["CVE-2", "CVE-3", "CVE-1"]);
 });
 

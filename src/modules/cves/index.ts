@@ -4,8 +4,9 @@ import type { ToolDefinition, ToolContext } from "../../types.js";
 import { fail, ok } from "../../utils/result.js";
 import { CVELIST_FULL_CORPUS_ESTIMATE, fetchEpss, kevForProduct, loadKev, loadProductIndex, nvdCveDetail } from "../cves/feeds.js";
 import { matchProgram, severityOf } from "../cves/engine.js";
+import { productFamily } from "../../utils/matching.js";
 import type { CveHit } from "../../model.js";
-import { buildTodo, mergeTodo } from "../todos/todo.js";
+import { groupMatchesIntoTodos, mergeTodo } from "../todos/todo.js";
 
 /** Extracts the english description and the highest CVSS out of an NVD API 2.0 answer. */
 function nvdFields(cve: Record<string, unknown>): { cvss: number | null; description: string | null } {
@@ -32,30 +33,31 @@ const NVD_ENRICH_CAP = 20;
  *
  * The local cvelist index is already consulted by the engine; whatever is still unscored is looked
  * up through the disk-cached NVD helper (24 h TTL, so a warm store costs no call at all). Each CVE
- * is fetched at most once per run and the answer is applied to every hit that carries it, because
- * one program's hit list is not worth thirty live calls. A hit that stays unscored is marked
- * `cvss_source: "unreachable"` rather than reported as `severity: "none"`.
+ * is fetched at most once per run and the answer is applied to **every** hit object that carries the
+ * id: the same CVE appears in several programs' hit lists, and enriching only the first object left
+ * the live beta with `cvss: 8.8` on one Edge to-do and `cvss: null` on the other. A hit that stays
+ * unscored is marked `cvss_source: "nvd_unreachable"` rather than reported as `severity: "none"`.
  */
-async function enrichKevHits(ctx: ToolContext, hits: CveHit[]): Promise<number> {
-  const missing: CveHit[] = [];
-  const seen = new Set<string>();
+export async function enrichKevHits(ctx: ToolContext, hits: CveHit[]): Promise<number> {
+  // One entry per CVE id, holding every hit object that carries it and still needs a score.
+  const missing = new Map<string, CveHit[]>();
   for (const hit of hits) {
     if (!hit.kev || hit.cvss !== null || hit.cvss_source !== undefined) continue;
-    if (seen.has(hit.cve_id) || missing.length >= NVD_ENRICH_CAP) continue;
-    seen.add(hit.cve_id);
-    missing.push(hit);
+    const list = missing.get(hit.cve_id);
+    if (list) list.push(hit);
+    else missing.set(hit.cve_id, [hit]);
   }
 
   let enriched = 0;
   let failures = 0;
-  for (const hit of missing) {
+  for (const [cveId, targets] of missing) {
     // Two dead lookups in a row mean NVD is unreachable or throttling; the rest stay unenriched
     // instead of burning the rate limit on the same answer.
-    if (failures >= 2) {
-      hit.cvss_source = "nvd_unreachable";
+    if (failures >= 2 || enriched >= NVD_ENRICH_CAP) {
+      for (const hit of targets) hit.cvss_source = "nvd_unreachable";
       continue;
     }
-    const res = await nvdCveDetail(ctx.http, ctx.config.settings.httpTimeoutMs, hit.cve_id);
+    const res = await nvdCveDetail(ctx.http, ctx.config.settings.httpTimeoutMs, cveId);
     const first = res.data
       ? ((res.data as { vulnerabilities?: { cve?: Record<string, unknown> }[] }).vulnerabilities ?? [])[0]
       : undefined;
@@ -63,20 +65,22 @@ async function enrichKevHits(ctx: ToolContext, hits: CveHit[]): Promise<number> 
 
     if (!res.data || !fields) {
       failures += 1;
-      hit.cvss_source = "nvd_unreachable";
+      for (const hit of targets) hit.cvss_source = "nvd_unreachable";
       continue;
     }
     failures = 0;
-    if (fields.cvss !== null) {
-      hit.cvss = fields.cvss;
-      hit.severity = severityOf(fields.cvss);
-      hit.cvss_source = "nvd";
-      enriched += 1;
-    } else {
-      hit.cvss_source = res.from === "none" ? "nvd_unreachable" : "nvd_no_score";
+    for (const hit of targets) {
+      if (fields.cvss !== null) {
+        hit.cvss = fields.cvss;
+        hit.severity = severityOf(fields.cvss);
+        hit.cvss_source = "nvd";
+      } else {
+        hit.cvss_source = res.from === "none" ? "nvd_unreachable" : "nvd_no_score";
+      }
+      if (hit.summary === null && fields.description) hit.summary = fields.description.slice(0, 300);
+      if (hit.published === null) hit.published = (first?.cve?.published as string | undefined) ?? null;
     }
-    if (hit.summary === null && fields.description) hit.summary = fields.description.slice(0, 300);
-    if (hit.published === null) hit.published = (first?.cve?.published as string | undefined) ?? null;
+    if (fields.cvss !== null) enriched += 1;
   }
 
   // Whatever the loop capped or skipped still gets an honest marker, so no hit reads as scored.
@@ -100,7 +104,11 @@ export const cveTools: ToolDefinition[] = [
       "The cvelistV5 delta is accumulated into a local index on every run that finds a newer release, so coverage grows " +
       "over days without the full 602 MB download. The answer reports how much the index currently covers.\n" +
       "Matching is name-based and carries a confidence per hit; an unsure match is reported with match_confidence and " +
-      "never counted as a certain hit.",
+      "never counted as a certain hit.\n" +
+      "Before a name match becomes a hit the version verdict decides: a known affected range that excludes the " +
+      "installed version drops it, an era-implausible pair (a 2016 CVE against Edge 155) drops too, and an unverifiable " +
+      "range keeps it unconfirmed. Rejections count up as dropped_by_verdict; programs only an installer .exe reported " +
+      "are skipped. Several installed versions of one product share one to-do whose versions list names the members.",
     input: z.object({
       refresh: z.boolean().optional().describe("Force re-download of the sources even when the cache is fresh"),
       with_epss: z.boolean().optional().describe("Look up EPSS scores for the matched CVEs. Defaults to true"),
@@ -130,38 +138,38 @@ export const cveTools: ToolDefinition[] = [
       let hitsTotal = 0;
       let kevHits = 0;
       let nvdEnriched = 0;
+      /** Name matches the version verdict rejected before they could become a hit (range or era). */
+      let droppedByVerdict = 0;
+      let skippedInstallerArtifacts = 0;
 
       if (dataAvailable) {
         const matched: { entry: import("../../model.js").InventoryEntry; hits: import("../../model.js").CveHit[] }[] = [];
         for (const entry of store.inventory) {
-          const { hits } = matchProgram(entry, index, kev);
-          if (hits.length === 0) continue;
-          matched.push({ entry, hits });
+          // A program only a downloaded installer .exe reported is archive residue, not installed
+          // software, and never becomes a security to-do.
+          if (entry.installer_artifact === true) {
+            skippedInstallerArtifacts += 1;
+            continue;
+          }
+          const m = matchProgram(entry, index, kev);
+          droppedByVerdict += m.dropped;
+          if (m.hits.length === 0) continue;
+          matched.push({ entry, hits: m.hits });
         }
 
         // A KEV hit the local index carries no score for is completed from the cached NVD helper
         // before any todo is built, so the hit level and the todo level can never disagree.
         nvdEnriched = await enrichKevHits(ctx, matched.flatMap((m) => m.hits));
 
-        for (const { entry, hits } of matched) {
-          programsChecked += 1;
-          hitsTotal += hits.length;
-          kevHits += hits.filter((h) => h.kev).length;
-          unconfirmedTotal += hits.filter((h) => h.unconfirmed === true).length;
-
-          // Only the confirmed hits decide how sure the whole entry is: an unverifiable KEV name match
-          // must not pull a certain finding down to "low".
-          const confirmed = hits.filter((h) => h.unconfirmed !== true);
-          const rated = confirmed.length > 0 ? confirmed : hits;
-          const confidence = rated.some((h) => h.match_confidence === "low")
-            ? "low"
-            : rated.every((h) => h.match_confidence === "exact")
-              ? "exact"
-              : rated.some((h) => h.match_confidence === "high")
-                ? "high"
-                : "medium";
-
-          const todo = buildTodo(entry, hits, confidence, cveStatus);
+        // Several installed versions of one product family (Edge 152 + Edge 155) become ONE todo
+        // whose `versions` list carries the members, so the list has no near-duplicate rows.
+        for (const todo of groupMatchesIntoTodos(
+          matched.map((m) => ({ family: productFamily(m.entry.name), entry: m.entry, hits: m.hits, cveStatus })),
+        )) {
+          programsChecked += todo.versions?.length ?? 1;
+          hitsTotal += todo.cves.length;
+          kevHits += todo.cves.filter((h) => h.kev).length;
+          unconfirmedTotal += todo.cves.filter((h) => h.unconfirmed === true).length;
           newTodos.push(mergeTodo(openTodos, todo));
         }
 
@@ -197,6 +205,14 @@ export const cveTools: ToolDefinition[] = [
            * the todos but do not lift `max_severity`, so a thin local index never inflates the risk.
            */
           unconfirmed_hits: unconfirmedTotal,
+          /**
+           * Name matches that never became hits because the version verdict rejected them: a known
+           * affected range that excludes the installed version, or the era heuristic (a 2016 CVE
+           * against Edge 155). Makes the pre-hit filtering visible instead of silent.
+           */
+          dropped_by_verdict: droppedByVerdict,
+          /** Programs skipped because only a downloaded installer .exe reported them. */
+          installer_artifacts_skipped: skippedInstallerArtifacts,
           /** Unscored KEV hits this run completed from NVD (the cached helper); the rest stay marked unenriched. */
           nvd_enriched: nvdEnriched,
           kev: { total: kev.total, from: kev.from, fetched_at: kev.fetched_at },
@@ -217,7 +233,9 @@ export const cveTools: ToolDefinition[] = [
         cveStatus === "unknown"
           ? `No CVE data reachable: inventory kept, ${String(store.todos.length)} todo(s) unchanged.`
           : `${String(hitsTotal)} CVE hit(s) on ${String(programsChecked)} program(s), ${String(kevHits)} actively exploited` +
-            `${unconfirmedTotal > 0 ? `, ${String(unconfirmedTotal)} unconfirmed (name match only, excluded from severity)` : ""}. ` +
+            `${unconfirmedTotal > 0 ? `, ${String(unconfirmedTotal)} unconfirmed (name match only, excluded from severity)` : ""}` +
+            `${droppedByVerdict > 0 ? `, ${String(droppedByVerdict)} name match(es) rejected by the version verdict` : ""}` +
+            `${skippedInstallerArtifacts > 0 ? `, ${String(skippedInstallerArtifacts)} installer artifact(s) skipped` : ""}. ` +
             `${String(store.todos.length)} todo(s) stored.`,
       );
     },

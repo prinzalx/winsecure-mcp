@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 
 import { severityOf } from "../cves/engine.js";
-import { compareVersions } from "../../utils/matching.js";
-import type { Assessment, CveHit, InventoryEntry, MatchConfidence, Todo, TodoStatus } from "../../model.js";
+import { compareVersions, normName, normVersion, productFamily } from "../../utils/matching.js";
+import type { Assessment, CveHit, InventoryEntry, MatchConfidence, Todo, TodoStatus, TodoVersion } from "../../model.js";
 
 /**
  * The fixed assessment schema of §5.
@@ -108,12 +108,18 @@ export function todoId(inventoryId: string, cveIds: string[]): string {
   return `todo-${hash.slice(0, 10)}`;
 }
 
-/** Aggregates a fresh todo out of a program and its hits. */
+/**
+ * Aggregates a fresh todo out of a program and its hits.
+ *
+ * `merge` is set when the todo stands for several installed versions of one product family: it then
+ * carries a family-stable id and the list of member versions instead of the single entry's.
+ */
 export function buildTodo(
   entry: InventoryEntry,
   hits: CveHit[],
   confidence: MatchConfidence,
   cveStatus: Todo["cve_status"],
+  merge?: { stable_id: string; inventory_id: string; versions: TodoVersion[] },
 ): Todo {
   const now = new Date().toISOString();
   const severities: Todo["max_severity"][] = ["none", "low", "medium", "high", "critical"];
@@ -142,8 +148,8 @@ export function buildTodo(
   const unconfirmed = hits.filter((h) => h.unconfirmed === true).map((h) => h.cve_id);
 
   return {
-    id: todoId(entry.id, hits.map((h) => h.cve_id)),
-    inventory_id: entry.id,
+    id: merge?.stable_id ?? todoId(entry.id, hits.map((h) => h.cve_id)),
+    inventory_id: merge?.inventory_id ?? entry.id,
     program: entry.name,
     version: entry.version,
     publisher: entry.publisher,
@@ -153,6 +159,8 @@ export function buildTodo(
     max_severity: maxSeverity,
     max_cvss: maxCvss,
     any_kev: anyKev,
+    kev_confirmed: kevConfirmed,
+    ...(merge !== undefined ? { versions: merge.versions } : {}),
     max_epss: maxEpss,
     fix_version: fix,
     match_confidence: confidence,
@@ -204,6 +212,112 @@ export function mergeTodo(existing: Todo[], fresh: Todo): Todo {
     updated_at: now,
   };
   return merged;
+}
+
+/**
+ * Whether a to-do carries at least one **verified** KEV finding.
+ *
+ * Written for stores that predate the field, so an old row is re-derived instead of read as
+ * `undefined` and ranked below every confirmed one.
+ */
+export function kevConfirmedOf(t: Todo): boolean {
+  return t.kev_confirmed ?? t.cves.some((c) => c.kev && c.unconfirmed !== true);
+}
+
+/** Whether a to-do carries at least one hit whose version was verified. `list_todos` ranks on it. */
+export function hasConfirmedFinding(t: Todo): boolean {
+  return t.cves.some((c) => c.unconfirmed !== true);
+}
+
+/**
+ * The ranking of `list_todos` and the dashboard, in one place so the two views agree:
+ * a verified KEV finding first, then any other verified finding, then severity, CVSS and EPSS. A
+ * to-do whose hits are all unverified name matches therefore never outranks a confirmed one.
+ */
+export function compareTodoRank(a: Todo, b: Todo): number {
+  return (
+    Number(kevConfirmedOf(b)) - Number(kevConfirmedOf(a)) ||
+    Number(hasConfirmedFinding(b)) - Number(hasConfirmedFinding(a)) ||
+    severityRank(b.max_severity) - severityRank(a.max_severity) ||
+    (b.max_cvss ?? 0) - (a.max_cvss ?? 0) ||
+    (b.max_epss ?? 0) - (a.max_epss ?? 0) ||
+    a.program.localeCompare(b.program, "en")
+  );
+}
+
+/**
+ * The confidence a group of hits is rated with: only confirmed hits decide it, so an unverifiable
+ * name match never pulls a certain finding down to "low".
+ */
+export function ratingConfidence(hits: CveHit[]): MatchConfidence {
+  const confirmed = hits.filter((h) => h.unconfirmed !== true);
+  const rated = confirmed.length > 0 ? confirmed : hits;
+  return rated.some((h) => h.match_confidence === "low")
+    ? "low"
+    : rated.every((h) => h.match_confidence === "exact")
+      ? "exact"
+      : rated.some((h) => h.match_confidence === "high")
+        ? "high"
+        : "medium";
+}
+
+/**
+ * Groups the matched programs into to-dos by **product family**.
+ *
+ * Two installed versions of one product ("Microsoft Edge" 152 and 155) are the same finding: the
+ * members merge into one to-do whose `versions` list carries every installed version, newest first,
+ * so the list shows one row per product instead of a near-duplicate per version. An empty family
+ * leaves an entry as its own group, exactly like before.
+ */
+export function groupMatchesIntoTodos(
+  matches: { family: string; entry: InventoryEntry; hits: CveHit[]; cveStatus: Todo["cve_status"] }[],
+): Todo[] {
+  interface Group {
+    rep: InventoryEntry;
+    members: InventoryEntry[];
+    hits: Map<string, CveHit>;
+    cveStatus: Todo["cve_status"];
+  }
+  const groups = new Map<string, Group>();
+
+  for (const m of matches) {
+    const key = m.family === "" ? `entry:${m.entry.id}` : `family:${m.family}`;
+    const g = groups.get(key);
+    if (!g) {
+      groups.set(key, { rep: m.entry, members: [m.entry], hits: new Map(m.hits.map((h) => [h.cve_id, h])), cveStatus: m.cveStatus });
+      continue;
+    }
+    g.members.push(m.entry);
+    for (const h of m.hits) {
+      const first = g.hits.get(h.cve_id);
+      // A KEV marker found through one member applies to the shared product; the hit object itself
+      // stays the first one, so exactly one row per CVE remains.
+      if (first) first.kev = first.kev || h.kev;
+      else g.hits.set(h.cve_id, h);
+    }
+    // The newest installed version becomes the representative row of the group.
+    const a = normVersion(m.entry.version ?? "");
+    const b = normVersion(g.rep.version ?? "");
+    if ((a !== "" && b === "") || (a !== "" && b !== "" && compareVersions(a, b) > 0)) g.rep = m.entry;
+  }
+
+  const todos: Todo[] = [];
+  for (const [key, g] of groups) {
+    const hits = [...g.hits.values()];
+    const rep = g.rep;
+    const merge =
+      g.members.length > 1
+        ? {
+            stable_id: todoId(`family:${normName(rep.name)}`, hits.map((h) => h.cve_id)),
+            inventory_id: key,
+            versions: [...g.members]
+              .sort((x, y) => compareVersions(normVersion(y.version ?? ""), normVersion(x.version ?? "")))
+              .map((e) => ({ inventory_id: e.id, program: e.name, version: e.version })),
+          }
+        : undefined;
+    todos.push(buildTodo(rep, hits, ratingConfidence(hits), g.cveStatus, merge));
+  }
+  return todos;
 }
 
 export function normalizeAssessment(input: Record<string, unknown>, by: Assessment["assessed_by"]): Assessment {

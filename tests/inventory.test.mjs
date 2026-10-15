@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { dedupePrograms, countSources, identityScore, sameProduct } from "../dist/modules/inventory/dedupe.js";
+import { isInstallerArtifact } from "../dist/modules/inventory/sources.js";
 
 function raw(source, name, version, extra = {}) {
   return {
@@ -66,6 +67,30 @@ test("identityScore ranks a package id over a display name", () => {
   assert.equal(identityScore({ ...base, package_ids: ["Acme.ExampleToolbar"] }).confidence, "exact");
   assert.equal(identityScore({ ...base }).confidence, "high");
   assert.equal(identityScore({ ...base, version: null }).confidence, "medium");
+});
+
+test("isInstallerArtifact tags a downloaded setup outside Program Files", () => {
+  assert.equal(isInstallerArtifact("C:\\Users\\user\\Documents\\npp.7.5.4.Installer.exe"), true);
+  assert.equal(isInstallerArtifact("D:\\downloads\\setup_x64.exe"), true);
+  // Inside Program Files the exe may legitimately be the install itself.
+  assert.equal(isInstallerArtifact("C:\\Program Files\\Git\\setup.exe"), false);
+  assert.equal(isInstallerArtifact("C:\\tools\\notepad.exe"), false);
+  assert.equal(isInstallerArtifact(null), false);
+});
+
+test("dedupePrograms keeps an entry an artifact only while every source reports it as one", () => {
+  const artifact = { installer_artifact: true };
+  const onlyExe = dedupePrograms([raw("portable", "Notepad++", "7.5.4", { path: "C:\\Users\\u\\Documents\\npp.Installer.exe", ...artifact })], []);
+  assert.equal(onlyExe[0].installer_artifact, true);
+
+  const installed = dedupePrograms(
+    [
+      raw("portable", "Notepad++", "7.5.4", { path: "C:\\Users\\u\\Documents\\npp.Installer.exe", ...artifact }),
+      raw("registry", "Notepad++", "7.5.4"),
+    ],
+    [],
+  );
+  assert.notEqual(installed[0].installer_artifact, true, "a registry hit proves the program is installed");
 });
 
 test("sameProduct tolerates small typographical distance only", () => {

@@ -1,5 +1,5 @@
 import { compareVersions, normName, normVersion, squeeze } from "../../utils/matching.js";
-import type { ProductIndex, KevIndex, CveRecord } from "./feeds.js";
+import type { ProductIndex, KevIndex, CveRecord, KevEntry } from "./feeds.js";
 import { kevForProduct } from "./feeds.js";
 import type { CveHit, InventoryEntry, MatchConfidence } from "../../model.js";
 
@@ -77,26 +77,65 @@ function isNumericish(v: string): boolean {
 }
 
 /**
+ * The cold-start plausibility verdict for a name-only match.
+ *
+ * A thin local delta index carries no range data for old CVEs (the delta only ever accumulates
+ * recent ones), so the range check cannot rule them out and a KEV name match alone would headline
+ * a 2016 EdgeHTML bug against Edge 155. The rule: the **era** of an installed version — the larger
+ * of its first two numeric segments, since product schemes encode the age in the major (Edge 155,
+ * 7-Zip 26) or the minor (Git 2.55, WhatsApp 2.2639) — must not sit clearly above the CVE's
+ * publication year. The *era* of a version is the larger of its first two numeric segments, because
+ * product schemes hide their age in either one: Edge 155 and 7-Zip 26 in the major, Git 2.55 and
+ * WhatsApp 2.2639 in the minor. `slack` of 25 tolerates the fastest common scheme before the pair
+ * counts as impossible: Edge 155 vs. a 2016 CVE, WhatsApp 2.2639 vs. 2019 and Git 2.55 vs. a 2025
+ * CVE drop, while 7-Zip 26.02 vs. a 2025 CVE stays plausibly kept (its real exclusion — affected is
+ * < 24.07 — comes with the range as soon as the delta index carries that CVE).
+ *
+ * The bias is deliberate and bounded: it only ever **drops a name-only match no range confirmed**,
+ * never creates a hit, and it never applies when a comparable range already decided the question.
+ * A product with a naturally high version number can lose an unconfirmed hit this way; the live
+ * beta showed the opposite error (old CVEs headlining) was the one users complained about.
+ */
+export function eraImplausible(installed: string | null, published: string | null): boolean {
+  if (!installed || !published) return false;
+  const year = Number.parseInt(published.slice(0, 4), 10);
+  // Only the modern era is judged; a CVE before 2000 has no comparable year scale here.
+  if (!Number.isFinite(year) || year < 2000) return false;
+  const parts = normVersion(installed).split(".");
+  const era = Math.max(Number.parseInt(parts[0] ?? "", 10) || 0, Number.parseInt(parts[1] ?? "", 10) || 0);
+  if (!Number.isFinite(era) || era === 0) return false;
+  const SLACK = 25;
+  return era > (year % 100) + SLACK;
+}
+
+/**
  * The CVE hits for one program, from the local product index plus the KEV overlay.
  *
  * `checked` says whether real CVE data was available at all. When it was not, the caller marks the
  * todo `cve_status: "unknown"` instead of reporting an empty hit list as "no vulnerabilities".
+ * `dropped` counts the name matches the version verdict rejected — a known affected range that
+ * excludes the installed version, or the era heuristic for a match no range can confirm.
  */
 export function matchProgram(
   entry: InventoryEntry,
   index: ProductIndex,
   kev: KevIndex,
-): { hits: CveHit[]; checked: boolean; data_from: string } {
+): { hits: CveHit[]; dropped: number; checked: boolean; data_from: string } {
   const checked = index.byProduct.size > 0 || kev.byCve.size > 0;
-  if (!checked) return { hits: [], checked: false, data_from: "none" };
+  if (!checked) return { hits: [], dropped: 0, checked: false, data_from: "none" };
 
   const byId = new Map<string, CveHit>();
+  // Counted once per CVE id: the product loop and the KEV overlay can both reject the same pair.
+  const droppedIds = new Set<string>();
 
   for (const cand of candidates(entry)) {
     const records = index.byProduct.get(normName(cand.name)) ?? [];
     for (const rec of records) {
       const verdict = versionAffected(entry.version, rec);
-      if (!verdict.affected) continue;
+      if (!verdict.affected) {
+        droppedIds.add(rec.cve_id);
+        continue;
+      }
       const existing = byId.get(rec.cve_id);
       if (existing) {
         if (rank(cand.confidence) > rank(existing.match_confidence)) existing.match_confidence = cand.confidence;
@@ -135,10 +174,22 @@ export function matchProgram(
 
     // A known range that excludes the installed version drops the hit entirely.
     const verdict = detail ? versionAffected(entry.version, detail) : null;
-    if (verdict && !verdict.affected) continue;
+    if (verdict && !verdict.affected) {
+      droppedIds.add(kevEntry.cve_id);
+      continue;
+    }
 
-    // No record, or bounds that cannot be compared: the version was not verified, so the hit stays
-    // unconfirmed and is reported apart instead of lifting the severity of the whole to-do.
+    // No record, or bounds that cannot be compared: the version was not verified. Before such a
+    // name-only match is kept, the era heuristic gets its chance to drop the obviously impossible
+    // pairs (a 2016 CVE against Edge 155), which is what carries the verdict in the cold-start phase
+    // where the thin delta index never learned a range for the old CVE at all.
+    if (verdict === null && eraImplausible(entry.version, detail?.published ?? kevPublishedHint(kevEntry))) {
+      droppedIds.add(kevEntry.cve_id);
+      continue;
+    }
+
+    // Bounds that could not be compared keep the hit but never call it verified, so it is reported
+    // apart instead of lifting the severity of the whole to-do.
     const unconfirmed = verdict === null || !verdict.exact;
 
     byId.set(kevEntry.cve_id, {
@@ -158,7 +209,16 @@ export function matchProgram(
     });
   }
 
-  return { hits: [...byId.values()], checked, data_from: index.from !== "none" ? index.from : kev.from };
+  return { hits: [...byId.values()], dropped: droppedIds.size, checked, data_from: index.from !== "none" ? index.from : kev.from };
+}
+
+/**
+ * The KEV feed carries no publication date, so the era hint falls back to the CVE id's year, which
+ * is when the vulnerability was assigned — close enough for a plausibility check and nothing more.
+ */
+function kevPublishedHint(entry: KevEntry): string | null {
+  const year = /^(?:CVE-)?(\d{4})-/i.exec(entry.cve_id)?.[1];
+  return year ? `${year}-01-01` : null;
 }
 
 export function hitsFromKevOnly(entry: InventoryEntry, kev: KevIndex): CveHit[] {

@@ -33,15 +33,14 @@ npm run build
 node dist/index.js
 ```
 
-The server prints an ASCII-shadow logo and announces where it lives — output, not arguments:
+The server prints an ASCII logo and announces where it lives — output, not arguments:
 
 ```
-██╗   ██╗███╗   ██╗ █████╗ ███████╗███████╗██╗   ██╗██████╗ ███████╗
-██║   ██║████╗  ██║██╔══██╗██╔════╝██╔════╝██║   ██║██╔══██╗██╔════╝
-██║   ██║██╔██╗ ██║███████║█████╗  █████╗  ██║   ██║██████╔╝█████╗
-██║   ██║██║╚██╗██║██╔══██║██╔══╝  ██╔══╝  ██║   ██║██╔══██╗██╔══╝
-╚██████╔╝██║ ╚████║██║  ██║███████╗███████╗╚██████╔╝██║  ██║███████╗
- ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝
+█     █ ███ █   █ █████ █████  ████ █   █ ████  █████
+█     █  █  ██  █ █     █     █     █   █ █   █ █
+█  █  █  █  █ █ █  ███  ████  █     █   █ ████  ████
+█ █ █ █  █  █  ██     █ █     █     █   █ █ █   █
+ ██ ██  ███ █   █ █████ █████  ████  ███  █  ██ █████
   version         v0.1.0
   data directory  C:\Users\<user>\AppData\Roaming\winsecure-mcp
   store file      C:\Users\<user>\AppData\Roaming\winsecure-mcp\winsecure.json
@@ -66,10 +65,16 @@ answer. `--no-web` (or `WSMD_NO_WEB=1`) keeps it stdio-only; `--port` / `WSMD_PO
 | `save_assessment` | Write the assessment back (the non-sampling path) |
 | `get_program` | Detail view of one finding (sources, paths, versions, assigned CVEs) |
 | `cve_detail` | NVD lookup of a single CVE |
+| `reset_todos` | Clear the whole list, or reset one entry to open (the way back to an empty list) |
 
 Every answer is wrapped the same way: a human summary line plus `structuredContent`, with english
 status words and ISO-8601 UTC timestamps throughout, so the output is **locale-independent**. An empty
 result is an answer, not an error.
+
+Beyond the tools, the store file is exposed as a read-only MCP **resource** (`winsecure://store.json`),
+so an agent can inspect the inventory and to-do JSON without invoking a tool. `check_cves` reports
+`cvelist.index_coverage` (local CVEs vs. the estimated full corpus), which tells "no hits found" apart
+from "the local index is still thin".
 
 ## Inventory Sources
 

@@ -123,19 +123,21 @@ export function matchProgram(
       continue;
     }
     // A KEV hit the product index does not carry is only kept when the product name matched exactly,
-    // because the KEV feed has no version range to check against.
+    // because the KEV feed has no version range to check against. The local index is still consulted
+    // by CVE id, so the hit does not render as cvss null / severity none while the todo says high.
+    const detail = index.byCve?.get(kevEntry.cve_id) ?? null;
     byId.set(kevEntry.cve_id, {
       cve_id: kevEntry.cve_id,
-      cvss: null,
-      severity: "none",
+      cvss: detail?.cvss ?? null,
+      severity: sev(detail?.cvss ?? null),
       kev: true,
       kev_due_date: kevEntry.due_date,
       epss: null,
-      fixed_version: null,
+      fixed_version: detail?.fixed_version ?? null,
       matched_by: "kev_product",
       match_confidence: "medium",
-      summary: kevEntry.name,
-      published: null,
+      summary: detail?.summary ?? kevEntry.name,
+      published: detail?.published ?? null,
     });
   }
 

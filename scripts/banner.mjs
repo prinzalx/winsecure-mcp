@@ -1,45 +1,40 @@
-#!/usr/bin/env node
-/**
- * Composes the ANSI-Shadow banner for a word, so the console logo can be regenerated instead of
- * hand-aligned. Usage: node scripts/banner.mjs WINSECURE MCP
- */
+// Regenerates the ASCII banner for src/index.ts and README.md.
+//
+// The letters are drawn on a strict 5-row grid of full-block cells, so every
+// column has exactly the same width in any monospace renderer. Earlier
+// versions used shadow/half-block box-drawing art, which drifted out of
+// alignment in GitHub's narrow fenced panel (the leading "W" got clipped).
+//
+//   node scripts/banner.mjs
+
+const ROWS = 5;
+
 const LETTERS = {
-  A: [" █████╗ ", "██╔══██╗", "███████║", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"],
-  B: ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔══██╗", "██║  ██║", "╚═╝  ╚═╝"],
-  C: [" ██████╗", "██╔════╝", "██║", "██║", "╚██████╗", " ╚═════╝"],
-  D: ["██████╗ ", "██║  ██║", "██║  ██║", "██║  ██║", "██████╔╝", "╚═════╝ "],
-  E: ["███████╗", "██╔════╝", "█████╗", "██╔══╝", "███████╗", "╚══════╝"],
-  K: ["██╗  ██╗", "██║ ██╔╝", "█████╔╝", "██╔═██╗", "██║  ██╗", "╚═╝  ╚═╝"],
-  M: ["███╗   ███╗", "████╗ ████║", "██╔████╔██║", "██║╚██╔╝██║", "██║ ╚═╝ ██║", "╚═╝     ╚═╝"],
-  N: ["███╗   ██╗", "████╗  ██║", "██╔██╗ ██║", "██║╚██╗██║", "██║ ╚████║", "╚═╝  ╚═══╝"],
-  P: ["██████╗", "██╔══██╗", "██████╔╝", "██╔═══╝", "██║", "╚═╝"],
-  R: ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔══██╗", "██║  ██║", "╚═╝  ╚═╝"],
-  S: [" █████╗ ", "██╔══██╗", "███████║", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"],
-  U: ["██╗   ██╗", "██║   ██║", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
-  V: ["██╗   ██╗", "██║   ██║", "██║   ██║", "╚██╗ ██╔╝", " ╚████╔╝", "  ╚═══╝"],
-  I: ["██╗", "██║", "██║", "██║", "██║", "╚═╝"],
-  F: ["███████╗", "██╔════╝", "█████╗", "██╔══╝", "██║", "╚═╝"],
-  T: ["████████╗", "╚══██╔══╝", "   ██║", "   ██║", "   ██║", "   ╚═╝"],
+  " ": ["     ", "     ", "     ", "     ", "     "],
+  A: [" ███ ", "█   █", "█████", "█   █", "█   █"],
+  C: [" ████", "█    ", "█    ", "█    ", " ████"],
+  E: ["█████", "█    ", "████ ", "█    ", "█████"],
+  I: ["███", " █ ", " █ ", " █ ", "███"],
+  N: ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
+  R: ["████ ", "█   █", "████ ", "█ █  ", "█  ██"],
+  S: ["█████", "█    ", " ███ ", "    █", "█████"],
+  U: ["█   █", "█   █", "█   █", "█   █", " ███ "],
+  W: ["█     █", "█     █", "█  █  █", "█ █ █ █", " ██ ██ "],
 };
 
-const words = process.argv.slice(2);
-if (words.length === 0) {
-  console.error("usage: node scripts/banner.mjs WORD [WORD...]");
-  process.exit(1);
+export function banner(text) {
+  const out = [];
+  for (let row = 0; row < ROWS; row += 1) {
+    out.push(
+      text
+        .split("")
+        .map((ch) => LETTERS[ch][row])
+        .join(" "),
+    );
+  }
+  return out.join("\n");
 }
 
-const groups = words.map((w) =>
-  w
-    .toUpperCase()
-    .split("")
-    .map((c) => LETTERS[c] ?? Array.from({ length: 6 }, () => " ")),
-);
-
-const rows = Array.from({ length: 6 }, (_, i) =>
-  groups.map((g) => g.map((l) => l[i] ?? "").join(" ")).join("   "),
-);
-
-const out = rows.join("\n");
-process.stdout.write(`${out}\n`);
-// Column width is what decides whether a terminal wraps the logo.
-process.stderr.write(`width: ${Math.max(...rows.map((r) => [...r].length))} columns\n`);
+if (process.argv[1] && process.argv[1].endsWith("banner.mjs")) {
+  console.log(banner("WINSECURE"));
+}

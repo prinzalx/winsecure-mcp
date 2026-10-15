@@ -14,7 +14,7 @@ function summarize(todos: Todo[]): string {
     .slice(0, 40)
     .map((t) => {
       const flag = t.any_kev ? "KEV" : "   ";
-      const assessed = t.assessment ? "assessed" : "open";
+      const assessed = t.status;
       return `${t.id}  ${flag}  ${t.max_severity.padEnd(8)}  cvss ${fmt(t.max_cvss)}  epss ${fmt(t.max_epss)}  ${String(t.cves.length).padStart(3)} CVE  ${t.match_confidence.padEnd(6)}  ${assessed}  ${t.program} ${t.version ?? ""}`;
     })
     .join("\n");
@@ -53,7 +53,7 @@ export const todoTools: ToolDefinition[] = [
       let todos = store.todos;
       if (statusFilter === "open" || statusFilter === "assessed" || statusFilter === "dismissed") {
         todos = todos.filter((t) => t.status === statusFilter);
-      } else {
+      } else if (statusFilter !== "all") {
         todos = todos.filter((t) => t.status !== "dismissed");
       }
       if (args.kev_only === true) todos = todos.filter((t) => t.any_kev);
@@ -189,6 +189,50 @@ export const todoTools: ToolDefinition[] = [
       return ok(
         { todo_id: todo.id, status: todo.status, assessment: todo.assessment },
         `${todo.program}: ${axisSummary(todo.assessment)} (status ${todo.status})`,
+      );
+    },
+  },
+  {
+    name: "reset_todos",
+    module: "todos",
+    title: "Reset to-dos",
+    description:
+      "Clear the to-do list back to empty, or reset one entry to open. The way back to a clean list without editing the JSON file.",
+    docs:
+      "Without a todo_id the whole list is dropped, which is the reset a fresh start needs. With a todo_id only that " +
+      "entry returns to status open and its stored assessment is cleared; the next check_cves refills the CVE facts.\n" +
+      "Only the server's own store file is written, so this stays within the same rule as every other write.",
+    input: z.object({
+      todo_id: z
+        .string()
+        .optional()
+        .describe("Reset a single to-do to open. Omit (or use \"*\") to clear the entire list"),
+    }),
+    handler: async (args, ctx) => {
+      const store = ctx.store.load();
+      const before = store.todos.length;
+      const id = args.todo_id === undefined || args.todo_id === "*" ? null : String(args.todo_id);
+
+      if (id === null) {
+        store.todos = [];
+        store.updated_at = new Date().toISOString();
+        ctx.store.save(store);
+        return ok(
+          { cleared: before, remaining: 0 },
+          `${String(before)} to-do(s) cleared.`,
+        );
+      }
+
+      const todo = findTodo(store, id);
+      if (!todo) return fail(`Unknown todo_id "${id}"`);
+      todo.status = "open";
+      todo.assessment = null;
+      todo.updated_at = new Date().toISOString();
+      store.updated_at = todo.updated_at;
+      ctx.store.save(store);
+      return ok(
+        { todo_id: todo.id, status: todo.status, remaining: store.todos.length },
+        `${todo.program} reset to open.`,
       );
     },
   },

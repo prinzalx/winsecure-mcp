@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import type { ToolDefinition } from "../../types.js";
 import { fail, ok } from "../../utils/result.js";
-import { fetchEpss, kevForProduct, loadKev, loadProductIndex, nvdCveDetail } from "../cves/feeds.js";
+import { CVELIST_FULL_CORPUS_ESTIMATE, fetchEpss, kevForProduct, loadKev, loadProductIndex, nvdCveDetail } from "../cves/feeds.js";
 import { matchProgram } from "../cves/engine.js";
 import { buildTodo, mergeTodo } from "../todos/todo.js";
 
@@ -102,6 +102,11 @@ export const cveTools: ToolDefinition[] = [
             products: index.products,
             from: index.from,
             fetched_at: index.fetched_at,
+            index_coverage: {
+              local_cves: index.totalCves,
+              corpus_estimate: CVELIST_FULL_CORPUS_ESTIMATE,
+              percent: Number(((index.totalCves / CVELIST_FULL_CORPUS_ESTIMATE) * 100).toFixed(1)),
+            },
           },
           todos: store.todos.length,
           source_errors: [kev.error, index.error].filter((e): e is string => Boolean(e)),
@@ -166,7 +171,7 @@ export const cveTools: ToolDefinition[] = [
           vuln_status: cve.vulnStatus ?? null,
           description: description.slice(0, 1000),
           cvss: v4 ?? v31 ?? null,
-          references: (cve.references ?? []).slice(0, 10).map((r) => String(r.url ?? "")),
+          references: [...new Set((cve.references ?? []).map((r) => String(r.url ?? "")))].slice(0, 10),
           source: "nvd",
           fetched_from: res.from,
         },

@@ -27,12 +27,11 @@ const VERSION = (() => {
 })();
 
 const BANNER = String.raw`
-██╗   ██╗███╗   ██╗ █████╗ ███████╗███████╗██╗   ██╗██████╗ ███████╗
-██║   ██║████╗  ██║██╔══██╗██╔════╝██╔════╝██║   ██║██╔══██╗██╔════╝
-██║   ██║██╔██╗ ██║███████║█████╗  █████╗  ██║   ██║██████╔╝█████╗
-██║   ██║██║╚██╗██║██╔══██║██╔══╝  ██╔══╝  ██║   ██║██╔══██╗██╔══╝
-╚██████╔╝██║ ╚████║██║  ██║███████╗███████╗╚██████╔╝██║  ██║███████╗
- ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝
+█     █ ███ █   █ █████ █████  ████ █   █ ████  █████
+█     █  █  ██  █ █     █     █     █   █ █   █ █
+█  █  █  █  █ █ █  ███  ████  █     █   █ ████  ████
+█ █ █ █  █  █  ██     █ █     █     █   █ █ █   █
+ ██ ██  ███ █   █ █████ █████  ████  ███  █  ██ █████
 `;
 
 const HELP = `winsecure-mcp — Windows CVE inventory MCP server
@@ -111,6 +110,19 @@ async function main(): Promise<void> {
       ((args: Record<string, unknown>) => invoke(tool, args ?? {}, ctx, activity, "stdio")) as never,
     );
   }
+
+  // A read-only window onto the store file, so an agent can inspect the inventory/to-do JSON without
+  // invoking a tool. It reads the file fresh each time, so it never disagrees with a prior write.
+  server.registerResource(
+    "winsecure.json",
+    "winsecure://store.json",
+    { title: "winsecure store", description: "The server's own JSON store: inventory and to-do list.", mimeType: "application/json" },
+    async (uri) => ({
+      contents: [
+        { uri: uri.href, mimeType: "application/json", text: JSON.stringify(store.load(), null, 2) },
+      ],
+    }),
+  );
 
   // The client capabilities are only known after the handshake, so sampling is decided per session
   // here rather than at construction time.

@@ -12,6 +12,13 @@ const EPSS_API = "https://api.first.org/data/v1/epss";
 const GITHUB_RELEASES = "https://api.github.com/repos/CVEProject/cvelistV5/releases?per_page=1";
 
 /**
+ * Rough size of the whole cvelistV5 corpus, used only to report how much of it the accumulated local
+ * delta index already covers. It is an estimate, not an API number, so `check_cves` labels the field
+ * `index_coverage` and the reader can tell "no hits found" from "index still thin".
+ */
+export const CVELIST_FULL_CORPUS_ESTIMATE = 290_000;
+
+/**
  * Product-name aliases for the gap between a Windows display name and a CVE product name.
  *
  * Phase 0 measured that an exact KEV name match hits 0.5 % of a real inventory, almost entirely
@@ -75,6 +82,11 @@ export interface CveRecord {
 export interface ProductIndex {
   /** Normalised product name -> CVE records. */
   byProduct: Map<string, CveRecord[]>;
+  /**
+   * CVE id -> one of its records. A CVE is one document, so cvss/summary/published are the same for
+   * every record of that id; the map exists so a KEV-only hit can be enriched without a live NVD call.
+   */
+  byCve: Map<string, CveRecord>;
   totalCves: number;
   products: number;
   fetched_at: string | null;
@@ -154,6 +166,7 @@ export async function loadProductIndex(
 
   const fail = (error: string): ProductIndex => ({
     byProduct: index.byProduct,
+    byCve: index.byCve,
     totalCves: index.totalCves,
     products: index.byProduct.size,
     fetched_at: index.fetched_at,
@@ -196,6 +209,7 @@ export async function loadProductIndex(
 
   return {
     byProduct: index.byProduct,
+    byCve: index.byCve,
     totalCves: index.totalCves,
     products: index.byProduct.size,
     fetched_at: index.fetched_at,
@@ -208,7 +222,8 @@ interface MutableIndex {
   tag: string | null;
   fetched_at: string | null;
   byProduct: Map<string, CveRecord[]>;
-  byCve: Set<string>;
+  /** CVE id -> first record seen for it, so a KEV-only hit can be enriched from the local index. */
+  byCve: Map<string, CveRecord>;
   totalCves: number;
 }
 
@@ -220,18 +235,18 @@ function readIndex(path: string): MutableIndex {
       records?: CveRecord[];
     };
     const byProduct = new Map<string, CveRecord[]>();
-    const byCve = new Set<string>();
+    const byCve = new Map<string, CveRecord>();
     for (const rec of raw.records ?? []) {
       const key = normName(rec.product);
       if (key === "" || !rec.cve_id) continue;
       const list = byProduct.get(key);
       if (list) list.push(rec);
       else byProduct.set(key, [rec]);
-      byCve.add(rec.cve_id);
+      if (!byCve.has(rec.cve_id)) byCve.set(rec.cve_id, rec);
     }
     return { tag: raw.tag ?? null, fetched_at: raw.fetched_at ?? null, byProduct, byCve, totalCves: byCve.size };
   } catch {
-    return { tag: null, fetched_at: null, byProduct: new Map(), byCve: new Set(), totalCves: 0 };
+    return { tag: null, fetched_at: null, byProduct: new Map(), byCve: new Map(), totalCves: 0 };
   }
 }
 
@@ -296,8 +311,9 @@ function mergeDelta(index: MutableIndex, buf: Buffer): { cves: number } {
         index.byProduct.set(key, [rec]);
       }
     }
-    if (!index.byCve.has(id)) {
-      index.byCve.add(id);
+    const first = records[0];
+    if (first && !index.byCve.has(id)) {
+      index.byCve.set(id, first);
       index.totalCves += 1;
     }
     count += 1;

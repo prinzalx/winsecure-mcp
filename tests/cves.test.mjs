@@ -55,7 +55,7 @@ test("versionAffected degrades to an unsure match instead of a false negative", 
 
 test("matchProgram reports checked=false when no CVE data is loaded", () => {
   const entry = { id: "x", name: "Tool", version: "1.0", publisher: null, sources: [], package_ids: [], paths: [], match_hint: "tool", first_seen: "", last_seen: "" };
-  const emptyIndex = { byProduct: new Map(), totalCves: 0, products: 0, fetched_at: null, from: "none" };
+  const emptyIndex = { byProduct: new Map(), byCve: new Map(), totalCves: 0, products: 0, fetched_at: null, from: "none" };
   const res = matchProgram(entry, emptyIndex, kevIndex([]));
   assert.equal(res.checked, false);
   assert.deepEqual(res.hits, []);
@@ -70,6 +70,7 @@ test("matchProgram marks the product-index hit and lets KEV flag exploitation", 
         { cve_id: "CVE-2026-2000", product: "Example Toolbar", vendor: null, summary: "s", published: null, cvss: 4, range_from: "1.0.0", range_below: "1.1.0", fixed_version: "1.1.0" },
       ]],
     ]),
+    byCve: new Map(),
     totalCves: 2, products: 1, fetched_at: null, from: "cache",
   };
   const kev = kevIndex([kevRow("CVE-2026-1000", "Example Toolbar"), kevRow("CVE-2026-3000", "Example Toolbar")]);
@@ -89,4 +90,23 @@ test("matchProgram marks the product-index hit and lets KEV flag exploitation", 
   const kevOnly = hits.find((h) => h.cve_id === "CVE-2026-3000");
   assert.equal(kevOnly.matched_by, "kev_product");
   assert.equal(kevOnly.cvss, null);
+});
+
+test("a KEV-only hit is enriched from the local index by CVE id", () => {
+  const entry = { id: "x", name: "Example Toolbar", version: "1.2.0", publisher: null, sources: [], package_ids: [], paths: [], match_hint: "example toolbar", first_seen: "", last_seen: "" };
+  const record = { cve_id: "CVE-2026-3000", product: "Example Toolbar", vendor: null, summary: "remote code execution", published: "2026-02-02T00:00:00Z", cvss: 7.5, range_from: null, range_below: null, fixed_version: "1.3.0" };
+  const index = {
+    byProduct: new Map(),
+    byCve: new Map([["CVE-2026-3000", record]]),
+    totalCves: 1, products: 0, fetched_at: null, from: "cache",
+  };
+  const kev = kevIndex([kevRow("CVE-2026-3000", "Example Toolbar")]);
+  const { hits } = matchProgram(entry, index, kev);
+  const hit = hits.find((h) => h.cve_id === "CVE-2026-3000");
+  assert.equal(hit.matched_by, "kev_product");
+  assert.equal(hit.cvss, 7.5);
+  assert.equal(hit.severity, "high");
+  assert.equal(hit.fixed_version, "1.3.0");
+  assert.equal(hit.summary, "remote code execution");
+  assert.equal(hit.published, "2026-02-02T00:00:00Z");
 });

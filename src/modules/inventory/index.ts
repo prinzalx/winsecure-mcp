@@ -194,7 +194,9 @@ export const inventoryTools: ToolDefinition[] = [
           })),
           count: matches.length,
         },
-        `${String(matches.length)} matching program(s): ${matches.map((m) => `${m.name} ${m.version ?? ""}`.trim()).join(", ")}`,
+        `${String(matches.length)} matching ${matches.length === 1 ? "program" : "programs"}: ${matches
+          .map((m) => `${m.name} ${m.version ?? ""}`.trim())
+          .join(", ")}`,
       );
     },
   },

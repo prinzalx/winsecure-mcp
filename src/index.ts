@@ -380,7 +380,7 @@ async function main(): Promise<void> {
         "  https://github.com/prinzalx/winsecure-mcp/blob/main/docs/nvd-key-vs-keyless.md\n",
     );
   } else {
-    process.stderr.write(`  NVD API key     set (from ${keyState.source === "env" ? "NVD_API_KEY" : "config"}) — mode nvd-keyed\n`);
+    process.stderr.write(`  NVD API key     set (from ${keyState.source === "env" ? "NVD_API_KEY" : keyState.source === "file" ? "nvd_api_key file" : "config"}) — mode nvd-keyed\n`);
     // A stored key is re-validated in the background, so a key that stopped working (typo, NVD
     // revocation) prints the same honest line again instead of silently querying into 401s.
     void validateNvdKey(keyState.key, config.settings.httpTimeoutMs).then((check) => {

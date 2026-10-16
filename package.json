@@ -1,6 +1,6 @@
 {
   "name": "winsecure-mcp",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Windows CVE inventory MCP server: installed software against CVE sources, with a persistent ToDo list and AI effort assessments",
   "type": "module",
   "license": "MIT",
@@ -23,7 +23,7 @@
     "start": "node dist/index.js",
     "web": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test \"tests/*.test.mjs\""
+    "test": "npm run build && node --test \"tests/*.test.mjs\" && node scripts/webui-syntax-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",

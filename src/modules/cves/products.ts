@@ -21,7 +21,7 @@ const NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0";
 const OSV_BATCH = "https://api.osv.dev/v1/querybatch";
 
 /** Where an API key came from. `null` means no key is configured at all. */
-export type KeySource = "env" | "config" | null;
+export type KeySource = "env" | "config" | "file" | null;
 
 export interface NvdKeyState {
   key: string | null;
@@ -33,13 +33,22 @@ export interface NvdKeyState {
  *
  * `NVD_API_KEY` wins over the key saved in the dashboard, because an operator who exports the
  * variable deliberately (a systemd unit, a container secret) must not be overridden by a stale
- * value in a JSON file they may not even know about.
+ * value in a JSON file they may not even know about. Last comes a plain-text `nvd_api_key` file
+ * in the data directory, so a host whose dashboard is unreachable can still run keyed without an
+ * environment (a single line with the key).
  */
 export function resolveNvdKey(config: ConfigStore): NvdKeyState {
   const env = process.env.NVD_API_KEY;
   if (typeof env === "string" && env.trim() !== "") return { key: env.trim(), source: "env" };
   const saved = config.settings.nvdApiKey;
   if (typeof saved === "string" && saved.trim() !== "") return { key: saved.trim(), source: "config" };
+  try {
+    // Read fresh on every call: a file dropped in while the server runs must be picked up.
+    const fileKey = readFileSync(join(config.settings.dataDir, "nvd_api_key"), "utf8").trim();
+    if (fileKey !== "") return { key: fileKey, source: "file" };
+  } catch {
+    // No file, or unreadable: same as no key.
+  }
   return { key: null, source: null };
 }
 

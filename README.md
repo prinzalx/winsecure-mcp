@@ -44,7 +44,7 @@ client's log instead.
 ██║███╗██║██║██║╚██╗██║╚════██║██╔══╝  ██║     ██║   ██║██╔══██╗██╔══╝     ██║╚██╔╝██║██║     ██╔═══╝
 ╚███╔███╔╝██║██║ ╚████║███████║███████╗╚██████╗╚██████╔╝██║  ██║███████╗   ██║ ╚═╝ ██║╚██████╗██║
  ╚══╝╚══╝ ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝   ╚═╝     ╚═╝ ╚═════╝╚═╝
-  version         v0.6.1
+  version         v0.6.2
   data directory  C:\Users\<user>\AppData\Roaming\winsecure-mcp
   store file      C:\Users\<user>\AppData\Roaming\winsecure-mcp\winsecure.json
   web interface   http://0.0.0.0:8788
@@ -152,7 +152,8 @@ on the normalised name, installer artifacts excluded), `check_cves`:
 
 Whether step 1 runs keyed or the whole thing falls back to a single OSV batch depends on the NVD
 API key: **`NVD_API_KEY`** in the environment wins, otherwise the key saved in the dashboard is
-used, otherwise the server runs keyless and says so — on the console
+used, then a single-line `nvd_api_key` file in the data directory (for hosts where the dashboard
+is not reachable), otherwise the server runs keyless and says so — on the console
 (`no valid NVD API key — check dashboard`) and in every answer (`mode:
 "nvd-keyed" | "keyless-osv+cached"`). [`docs/nvd-key-vs-keyless.md`](docs/nvd-key-vs-keyless.md)
 compares the two in one table: cost, speed, completeness, update semantics.
@@ -198,7 +199,7 @@ Defaults work out of the box; the server writes them out on first save.
 Environment overrides: `WSMD_CONFIG` (config file), `WSMD_DATA_DIR` (data directory),
 `WSMD_OFFLINE=1` (switch the network off — the offline test), `WSMD_HOST` / `WSMD_PORT` (the
 listener's bind address and port), `WSMD_NO_WEB` (the dashboard), `NVD_API_KEY` (overrides the key
-saved in the config). CLI
+saved in the config), plus an `nvd_api_key` file in the data directory as the last fallback. CLI
 `--host` / `--config` / `--data-dir` / `--port` / `--no-web` win.
 
 ## Development

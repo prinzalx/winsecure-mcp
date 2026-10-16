@@ -199,10 +199,10 @@
 
       // Survive the periodic re-render: a typed key must not be wiped by refresh(), and neither
       // must the feedback line next to the field, which render() rewrites every 15 s.
-      let keyDraft: string | null = null;
+      let keyDraft = null;
       let keyMsg = "";
-      /** The masked saved key from the server; the field shows it as its default value. */
-      let keyMasked: string | null = null;
+      /** The masked saved key from the server; the field shows it as its own value. */
+      let keyMasked = null;
 
       function render(state) {
         $("#meta").textContent =

@@ -12,7 +12,9 @@ How those product answers are obtained depends on one thing: whether an NVD API 
 
 1. the environment variable `NVD_API_KEY` (wins when both are set),
 2. otherwise the key saved in the dashboard under **NVD API key** (persisted in the config file),
-3. otherwise no key, and the server runs keyless.
+3. otherwise a single-line `nvd_api_key` file in the data directory, for a host whose dashboard is
+   not reachable,
+4. otherwise no key, and the server runs keyless.
 
 Without a key the console prints, at startup and on every failed key validation:
 

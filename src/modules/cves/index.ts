@@ -123,7 +123,7 @@ export const cveTools: ToolDefinition[] = [
     module: "cves",
     title: "Check CVEs",
     description:
-      "Match the stored inventory against the CVE sources (per-product NVD lookup, CISA KEV, EPSS) and fill the ToDo list. Never requires the network.",
+      "Match the stored inventory against the CVE sources (per-product NVD lookup, CISA KEV, EPSS) and fill the ToDo list. Answers come from the per-product cache when it is fresh; the network is only touched for what changed.",
     docs:
       "Offline rule: the run never depends on the network. Every source is read from its disk cache when the cache is " +
       "fresh; when the network is down the expired cache is still used, and only a cold cache with no network yields " +

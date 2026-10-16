@@ -8,11 +8,14 @@ import {
   looksLikeNvdKey,
   lookupProducts,
   mergeRecords,
+  nvdKeyHealth,
   osvCveId,
+  recordKeyProbe,
   resolveNvdKey,
   validateNvdKey,
+  __testing,
 } from "../dist/modules/cves/products.js";
-import { productNames } from "../dist/modules/cves/index.js";
+import { buildCompleteness, productNames } from "../dist/modules/cves/index.js";
 import { postCached } from "../dist/utils/net.js";
 
 const VALID_KEY = "0123456789abcdef0123456789abcdef";
@@ -87,9 +90,38 @@ test("looksLikeNvdKey accepts the old 32-hex and the new UUID format", () => {
 
 test("validateNvdKey rejects a malformed key without a network call", async () => {
   const check = await validateNvdKey("not-a-key");
-  assert.equal(check.valid, false);
+  assert.equal(check.status, "rejected");
   assert.match(String(check.error), /valid NVD key format/);
-  assert.equal((await validateNvdKey("")).valid, false);
+  assert.equal((await validateNvdKey("")).status, "rejected");
+});
+
+test("validateNvdKey sends the key as the apiKey HEADER, never as a query parameter", async () => {
+  const previous = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: String(url), headers: init?.headers ?? {} });
+    return new Response('{"totalResults":0,"vulnerabilities":[]}', { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const check = await validateNvdKey(UUID_KEY, 5000);
+    assert.equal(check.status, "valid");
+    assert.equal(requests.length, 1, "exactly one probe request");
+    assert.equal(new URL(requests[0].url).searchParams.get("apiKey"), null, "the key must not ride in the query string");
+    assert.equal(requests[0].headers.apiKey, UUID_KEY, "NVD API 2.0 wants the key in the `apiKey` header");
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
+test("a probe answered 429 leaves the key unknown, never rejected", async () => {
+  const previous = globalThis.fetch;
+  globalThis.fetch = async () => new Response("error code: 1015", { status: 429 });
+  try {
+    const check = await validateNvdKey(UUID_KEY, 5000);
+    assert.equal(check.status, "unknown", "a rate limit says nothing about the key's validity");
+  } finally {
+    globalThis.fetch = previous;
+  }
 });
 
 test("osvCveId pulls the CVE out of every OSV advisory namespace", () => {
@@ -542,3 +574,171 @@ test("postCached answers from disk within the TTL and writes one file per body",
   assert.equal(other.from, "none");
   assert.equal(readdirSync(cacheDir).length, 1, "the offline attempt wrote no second entry");
 });
+
+// ---------------------------------------------------------------------------
+// v0.6.6: the 404 shapes split apart, the key gets a health state, the breaker
+// ---------------------------------------------------------------------------
+
+/**
+ * An {@link Http} stand-in that records every request (url AND headers) and answers each product
+ * with what the handler returns — the mocked NVD client the v0.6.6 tests need, because the
+ * failure class now lives in the `message` response header, which `offlineHttp` cannot carry.
+ */
+function mockHttp(cacheDir, handler) {
+  const calls = [];
+  return {
+    cacheDir,
+    calls,
+    async get(url, ttlMs, headers) {
+      calls.push({ url: String(url), headers: headers ?? {} });
+      const product = new URL(String(url)).searchParams.get("keywordSearch");
+      return handler(product, calls.length);
+    },
+    async getBinary() {
+      return { body: null, from: "none", fetched_at: null, error: "offline" };
+    },
+  };
+}
+
+/**
+ * Run one keyed lookup against a mocked NVD, with the environment isolated and maps reset.
+ *
+ * `WSMD_OFFLINE` is cleared: the {@link Http} above is a mock (no real network to switch off) and
+ * the offline flag would no-op the throttle, which is exactly what these tests assert on.
+ */
+async function keyedRun(cacheDir, http, names, extra = {}, key = VALID_KEY) {
+  const previousKey = process.env.NVD_API_KEY;
+  if (key === null) delete process.env.NVD_API_KEY;
+  else process.env.NVD_API_KEY = key;
+  const previousOffline = process.env.WSMD_OFFLINE;
+  delete process.env.WSMD_OFFLINE;
+  try {
+    return await lookupProducts({
+      http,
+      config: configWith(null, extra),
+      cacheDir,
+      names,
+      ttlMs: 24 * 60 * 60 * 1000,
+      force: false,
+    });
+  } finally {
+    if (previousKey === undefined) delete process.env.NVD_API_KEY;
+    else process.env.NVD_API_KEY = previousKey;
+    if (previousOffline === undefined) delete process.env.WSMD_OFFLINE;
+    else process.env.WSMD_OFFLINE = previousOffline;
+  }
+}
+
+test("the product query sends the key as apiKey HEADER and not in the query string (v0.6.6 diagnosis)", async (t) => {
+  const cacheDir = tempCacheDir();
+  t.after(() => { __testing.reset(cacheDir); rmSync(cacheDir, { recursive: true, force: true }); });
+
+  const http = mockHttp(cacheDir, () => ({
+    body: '{"totalResults":0,"vulnerabilities":[]}', from: "network", fetched_at: new Date().toISOString(),
+  }));
+  const result = await keyedRun(cacheDir, http, [{ name: "git", wanted: new Set(["git"]) }]);
+
+  assert.equal(result.stats.mode, "nvd-keyed");
+  assert.equal(http.calls.length, 1);
+  assert.equal(http.calls[0].headers.apiKey, VALID_KEY, "the key must ride in the `apiKey` header");
+  assert.equal(new URL(http.calls[0].url).searchParams.get("apiKey"), null, "…and not in the query string (NVD 404s it there)");
+});
+
+test("a 404 with message 'Invalid apiKey.' marks the key rejected, pauses the drain, and switches lookups keyless", async (t) => {
+  const cacheDir = tempCacheDir();
+  t.after(() => { __testing.reset(cacheDir); rmSync(cacheDir, { recursive: true, force: true }); });
+
+  // NVD's exact live answer for a key it refuses (verified 2026-10-16): HTTP 404, EMPTY body,
+  // reason only in the `message` header.
+  const http = mockHttp(cacheDir, () => ({
+    body: null, from: "none", fetched_at: null, error: "HTTP 404", status: 404, bodyText: "", message: "Invalid apiKey.",
+  }));
+  const names = [
+    { name: "git", wanted: new Set(["git"]) },
+    { name: "edge", wanted: new Set(["edge"]) },
+  ];
+  // The key-rejection pause stays far below the call's 20 s budget here, so one call still
+  // reaches both products and the assertions below see a complete picture of the run.
+  const first = await keyedRun(cacheDir, http, names, { nvdBreakerPauseMs: 3_000 });
+
+  assert.equal(first.stats.key_rejected, 2, "both lookups classify as key_rejected, not as generic 404 failures");
+  assert.equal(first.stats.failed_404, 0, "a key rejection is NOT counted with the unexplained 404s");
+  assert.equal(first.stats.key_status, "rejected", "the health state flips to rejected");
+  assert.equal(nvdKeyHealth(cacheDir).status, "rejected");
+  assert.ok(
+    __testing.queues(cacheDir)[0].throttle.pausedUntilMs() > Date.now(),
+    "the drain is paused — no retry storm against an endpoint that refuses the key",
+  );
+
+  const completeness = buildCompleteness(first.stats, false, "checked");
+  assert.ok(completeness.reasons.includes("nvd_key_rejected"), "an agent can tell a config problem from a slow warm-up");
+  assert.match(completeness.hint, /key/i, "the hint says what to do about the key");
+  assert.equal(completeness.needs_attention, true);
+
+  // Task 4: with the key rejected, further requests go out KEYLESS (no apiKey header) so progress
+  // stays possible; the pacing moves to the keyless queue.
+  http.calls.length = 0;
+  // One product only: the rejection pacing is now the keyless window (6 s spacing), and what
+  // matters here is that the request goes out WITHOUT the rejected key, not how many do.
+  const second = await keyedRun(cacheDir, http, [names[0]], { nvdBreakerPauseMs: 3_000 });
+  assert.ok(http.calls.length > 0, "the second run still asks NVD — progress continues at the keyless rate");
+  for (const call of http.calls) assert.equal(call.headers.apiKey, undefined, "requests go out without the rejected key");
+  assert.ok(second.stats.key_status === "rejected");
+});
+
+test("a 404 with message 'Invalid parameter: …' is request_invalid and retries stay bounded", async (t) => {
+  const cacheDir = tempCacheDir();
+  t.after(() => { __testing.reset(cacheDir); rmSync(cacheDir, { recursive: true, force: true }); });
+
+  const http = mockHttp(cacheDir, () => ({
+    body: null, from: "none", fetched_at: null, error: "HTTP 404", status: 404, bodyText: "", message: "Invalid parameter: keywordSearch.",
+  }));
+  const names = [{ name: "git", wanted: new Set(["git"]) }];
+  const first = await keyedRun(cacheDir, http, names, { nvdRequestInvalidMaxAttempts: 2 });
+  assert.equal(first.stats.request_invalid, 1);
+  assert.equal(first.stats.failed_404, 0, "an invalid request is not the unexplained 404 class");
+  assert.equal(first.stats.deferred, 1, "the first failure stays open for one retry");
+
+  const completeness = buildCompleteness(first.stats, false, "checked");
+  assert.ok(completeness.reasons.includes("nvd_requests_invalid"));
+
+  // After the bounded retries the product CLOSES OUT: the third call must not ask again forever.
+  await keyedRun(cacheDir, http, names, { nvdRequestInvalidMaxAttempts: 2 });
+  http.calls.length = 0;
+  const third = await keyedRun(cacheDir, http, names, { nvdRequestInvalidMaxAttempts: 2 });
+  assert.equal(http.calls.length, 0, "attempts beyond the bound are not retried — no endless rotation");
+  assert.equal(third.stats.deferred, 0, "the closed-out product leaves the queue, so deferred can reach 0");
+});
+
+test("a 404 with an NVD envelope stays a real not_found with TTL (v0.6.5 semantics preserved)", async (t) => {
+  const cacheDir = tempCacheDir();
+  t.after(() => { __testing.reset(cacheDir); rmSync(cacheDir, { recursive: true, force: true }); });
+
+  const http = mockHttp(cacheDir, () => ({
+    body: null, from: "none", fetched_at: null, error: "HTTP 404", status: 404,
+    bodyText: '{"resultsPerPage":0,"totalResults":0,"format":"NVD_CVE","vulnerabilities":[]}',
+  }));
+  const names = [{ name: "whatsapp", wanted: new Set(["whatsapp"]) }];
+  const first = await keyedRun(cacheDir, http, names);
+  assert.equal(first.stats.not_found, 1);
+  http.calls.length = 0;
+  await keyedRun(cacheDir, http, names);
+  assert.equal(http.calls.length, 0, "the negative is trusted inside its TTL");
+});
+
+test("the circuit breaker pauses the drain after N consecutive failures without a single 200", async (t) => {
+  const cacheDir = tempCacheDir();
+  t.after(() => { __testing.reset(cacheDir); rmSync(cacheDir, { recursive: true, force: true }); });
+
+  // 404 without message and without envelope: the shape that hid the empty cache for 7 runs.
+  const http = mockHttp(cacheDir, () => ({
+    body: null, from: "none", fetched_at: null, error: "HTTP 404", status: 404, bodyText: "",
+  }));
+  const names = Array.from({ length: 4 }, (_, i) => ({ name: `p${String(i)}`, wanted: new Set([`p${String(i)}`]) }));
+  const result = await keyedRun(cacheDir, http, names, { nvdBreakerThreshold: 3 });
+  assert.equal(nvdKeyHealth(cacheDir).tripped, true, "3 failures, no 200 → breaker open");
+  assert.equal(result.stats.breaker_tripped, true);
+  const completeness = buildCompleteness(result.stats, false, "checked");
+  assert.ok(completeness.reasons.includes("nvd_all_lookups_failing"), "an agent sees 'every lookup fails', not 'few hits'");
+});
+

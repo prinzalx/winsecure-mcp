@@ -32,6 +32,21 @@ test("a long Retry-After wins over the exponential backoff", () => {
   assert.ok(t.pausedUntilMs() - Date.now() >= 40_000, "a 45 s Retry-After must be honored");
 });
 
+test("pauseFor holds the whole queue; resume lifts every pause (v0.6.6 breaker/key states)", () => {
+  const t = new NvdThrottle(600, false, 0, 60_000);
+  t.pauseFor(30_000);
+  assert.ok(t.pausedUntilMs() - Date.now() >= 29_000, "pauseFor sets a long pause");
+  // A shorter pause must not shorten an active one — the queue keeps waiting for the longest reason.
+  t.pauseFor(1_000);
+  assert.ok(t.pausedUntilMs() - Date.now() >= 28_000, "a short pauseFor does not cancel a long pause");
+  t.resume();
+  assert.equal(t.pausedUntilMs(), 0, "resume lifts the pause so the drain may run again");
+  // An offline throttle stays immediately usable either way.
+  const off = new NvdThrottle(600, true, 0, 60_000);
+  off.pauseFor(30_000);
+  assert.equal(off.pausedUntilMs(), 0, "offline never pauses");
+});
+
 test("an offline throttle never waits", async () => {
   const t = new NvdThrottle(600, true, 200, 60_000);
   const start = Date.now();

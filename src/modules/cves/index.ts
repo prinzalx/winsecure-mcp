@@ -2,7 +2,16 @@ import { z } from "zod";
 
 import type { ToolDefinition, ToolContext } from "../../types.js";
 import { fail, ok } from "../../utils/result.js";
-import { CVELIST_FULL_CORPUS_ESTIMATE, fetchEpss, kevForProduct, loadKev, loadProductIndex, nvdCveDetail, type ProductIndex } from "../cves/feeds.js";
+import {
+  CVELIST_FULL_CORPUS_ESTIMATE,
+  fetchEpss,
+  kevForProduct,
+  loadKev,
+  loadProductIndex,
+  nvdCveDetail,
+  type CveRecord,
+  type ProductIndex,
+} from "../cves/feeds.js";
 import { candidates, matchProgram, severityOf } from "../cves/engine.js";
 import { lookupProducts, resolveNvdKey } from "./products.js";
 import { normName, productFamily } from "../../utils/matching.js";
@@ -123,18 +132,28 @@ export const cveTools: ToolDefinition[] = [
     module: "cves",
     title: "Check CVEs",
     description:
-      "Match the stored inventory against the CVE sources (per-product NVD lookup, CISA KEV, EPSS) and fill the ToDo list. Answers come from the per-product cache when it is fresh; the network is only touched for what changed.",
+      "Match the stored inventory against the CVE sources (per-product NVD lookup, CISA KEV, EPSS) and fill the ToDo list. Answers come from the per-product cache when it is fresh; the network is only touched for what changed. A cold keyed start is paced by NVD's rate limit: the call answers within a time budget and the rest of the queue drains in the background — read `completeness` before concluding.\n" +
+      "Never requires the network, but a cold keyed start does need time: see completeness.status \"incomplete\".",
     docs:
       "Offline rule: the run never depends on the network. Every source is read from its disk cache when the cache is " +
       "fresh; when the network is down the expired cache is still used, and only a cold cache with no network yields " +
       "cve_status: \"unknown\" with the inventory left untouched by the CVE layer.\n" +
       "Since v0.6.0 the inventory drives the lookup: each installed product is queried at NVD API 2.0 and its answer is " +
       "cached per product, so coverage is complete on day one instead of growing with the corpus. The answer reports the " +
-      "mode and the cache stats. With a valid NVD key the mode is nvd-keyed (50 requests per 30 s); without one the " +
-      "server falls back to keyless-osv+cached — one OSV batch query plus whatever the product cache already holds — " +
-      "which is thinner, and the answer says so rather than letting a small hit count look like a clean machine.\n" +
-      "The pre-v0.6.0 cvelist delta index is kept as the offline fallback and its counters are still reported, marked " +
-      "deprecated, for one more release.\n" +
+      "mode and the cache stats. With a valid NVD key the mode is nvd-keyed: since v0.6.3 the requests are paced to " +
+      "NVD's window (50 per 30 s by default, settings nvdRatePerWindow / nvdWindowMs) instead of fired as a salvo, an " +
+      "HTTP 429 pauses the whole queue for its Retry-After, and the call stops at the per-call time budget " +
+      "(nvdCallBudgetMs, default 20 s) and lets the rest drain in the background — products with a KEV hit are asked " +
+      "first. Without a key the server falls back to keyless-osv+cached — one OSV batch query plus whatever the " +
+      "product cache already holds — which is thinner, and the answer says so rather than letting a small hit count " +
+      "look like a clean machine.\n" +
+      "Since v0.6.3 a failed lookup is not done: transient failures (429/404/5xx/timeout) leave the product deferred " +
+      "and it is retried on a later run; only a full answer with zero results caches a short-lived not_found marker. " +
+      "A keyless OSV cache entry never counts fresh in keyed mode — it lacks CVSS and ranges, so keyed mode re-asks " +
+      "NVD to enrich it.\n" +
+      "The pre-v0.6.0 cvelist delta index is loaded in every mode since v0.6.3 and merged into the product answers " +
+      "(deduplicated by CVE id), so a keyed cold start never answers less than a keyless one; its counters are still " +
+      "marked deprecated.\n" +
       "EPSS is looked up for every matched CVE — unconfirmed name matches included — and an unreachable feed appears in " +
       "source_errors as an epss entry, so a null score is never silent.\n" +
       "Matching is name-based and carries a confidence per hit; an unsure match is reported with match_confidence and " +
@@ -157,17 +176,24 @@ export const cveTools: ToolDefinition[] = [
       const ttl = (h: number) => (args.refresh === true ? 0 : h * 60 * 60 * 1000);
       const cacheDir = `${settings.dataDir}/cache`;
 
-      const [kev, lookup] = await Promise.all([
-        loadKev(ctx.http, ttl(settings.kevTtlHours)),
-        lookupProducts({
-          http: ctx.http,
-          config: ctx.config,
-          cacheDir,
-          names: productNames(store.inventory),
-          ttlMs: ttl(settings.cvelistTtlHours),
-          force: args.refresh === true,
-        }),
-      ]);
+      // KEV first, because its product set decides which NVD lookups the keyed queue asks about
+      // first: the actively exploited programs must be answered inside the first call's time budget.
+      const kev = await loadKev(ctx.http, ttl(settings.kevTtlHours));
+      const priority = new Set<string>();
+      for (const entry of store.inventory) {
+        if (kevForProduct(kev, entry.name).length === 0) continue;
+        for (const cand of candidates(entry)) priority.add(normName(cand.name));
+      }
+
+      const lookup = await lookupProducts({
+        http: ctx.http,
+        config: ctx.config,
+        cacheDir,
+        names: productNames(store.inventory),
+        ttlMs: ttl(settings.cvelistTtlHours),
+        force: args.refresh === true,
+        priority,
+      });
 
       // The product cache is the primary source now. Only when it answers nothing at all (a cold
       // cache plus no network) does the run fall back to whatever the legacy cvelist delta index
@@ -184,6 +210,7 @@ export const cveTools: ToolDefinition[] = [
         const legacy = await loadProductIndex(ctx.http, ttl(settings.cvelistTtlHours), cacheDir);
         if (legacy.byProduct.size > 0) index = legacy;
       }
+
 
       const dataAvailable = index.byProduct.size > 0 || kev.byCve.size > 0;
       const cveStatus: "checked" | "unknown" = dataAvailable ? "checked" : "unknown";
@@ -302,6 +329,13 @@ export const cveTools: ToolDefinition[] = [
               percent: Number(((index.totalCves / CVELIST_FULL_CORPUS_ESTIMATE) * 100).toFixed(1)),
             },
           },
+          /**
+           * Whether this run's answer may be read as complete (task 4, v0.6.3). A cold or throttled
+           * NVD walk leaves products unanswered; that is NOT "no vulnerabilities", and a reader —
+           * especially an LLM agent — must re-run after a wait before drawing a conclusion. The
+           * existing `cve_status` values are untouched: `checked_data: "incomplete"` is the additive
+           * marker that sits next to them.
+           */
           todos: store.todos.length,
           source_errors: [
             kev.error,

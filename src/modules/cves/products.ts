@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { normName } from "../../utils/matching.js";
+import { NvdThrottle } from "../../utils/throttle.js";
 import { postCached, type CachedFetch, type Http } from "../../utils/net.js";
 import type { ConfigStore } from "../../config.js";
 import type { CveRecord } from "./feeds.js";
@@ -308,15 +309,6 @@ function newestLastModified(vulnerabilities: { cve?: NvdCveJson }[]): string | n
 // NVD's own paging maximum; a bigger page means fewer requests against a strict rate limit.
 const NVD_PAGE_SIZE = 2000;
 
-/**
- * NVD's keyless window is 5 requests per 30 s, the keyed window 50 per 30 s — and both windows are
- * counted from the first request, so bursting 50 keyed calls in two seconds is fine but bursting
- * 100 is not. Requests are spread to stay inside the window instead of eating an HTTP 503.
- */
-function rateLimitMs(keyed: boolean): number {
-  return keyed ? 650 : 6_200;
-}
-
 /** NVD rejects a `lastModStartDate`/`lastModEndDate` window wider than 120 days. */
 const MAX_LASTMOD_WINDOW_DAYS = 120;
 
@@ -337,8 +329,18 @@ async function nvdProductQuery(
     key: string | null;
     sinceModified: string | null;
     maxPages: number;
+    /** Shared pacing gate; every page request goes through it (task 1, v0.6.3). */
+    throttle: NvdThrottle;
   },
-): Promise<{ records: CveRecord[]; lastModified: string | null; truncated: boolean; error?: string }> {
+): Promise<{
+  records: CveRecord[];
+  lastModified: string | null;
+  truncated: boolean;
+  error?: string;
+  /** HTTP status of the failed request, when one failed (used for the failure classes). */
+  status?: number;
+  retryAfterMs?: number;
+}> {
   const collected: CveRecord[] = [];
   let lastModified: string | null = null;
   let error: string | undefined;
@@ -360,10 +362,11 @@ async function nvdProductQuery(
     }
     if (opts.key) params.set("apiKey", opts.key);
 
+    await opts.throttle.acquire();
     const res = await http.get(`${NVD_API}?${params.toString()}`, 0);
     if (!res.body) {
       error = res.error ?? "no answer";
-      break;
+      return { records: collected, lastModified, truncated: page > 0, error, status: res.status, retryAfterMs: res.retryAfterMs };
     }
     let parsed: { totalResults?: number; vulnerabilities?: { cve?: NvdCveJson }[] };
     try {
@@ -380,14 +383,9 @@ async function nvdProductQuery(
     if (vulns.length < NVD_PAGE_SIZE || (page + 1) * NVD_PAGE_SIZE >= total) {
       return { records: collected, lastModified, truncated: false, error };
     }
-    await sleep(rateLimitMs(opts.key !== null));
   }
 
   return { records: collected, lastModified, truncated: true, error };
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ---------------------------------------------------------------------------
@@ -468,8 +466,15 @@ export async function lookupProducts(options: {
   names: { name: string; wanted: Set<string>; version?: string | null }[];
   ttlMs: number;
   force: boolean;
+  /**
+   * Normalised names the caller wants asked first — in practice the products with a KEV hit, so a
+   * cold keyed start reaches the actively exploited products inside the first call's time budget.
+   */
+  priority?: Set<string>;
 }): Promise<ProductLookupResult> {
   const { http, config, cacheDir, names } = options;
+  const settings = config.settings;
+  const offline = process.env.WSMD_OFFLINE === "1";
   const cache = new ProductCache(cacheDir);
   const keyState = resolveNvdKey(config);
   const keyed = keyState.key !== null;
@@ -478,6 +483,9 @@ export async function lookupProducts(options: {
   // One entry per distinct failure reason with a product count, because an offline keyed run
   // fails on every product and must not flood `source_errors` with 60 near-identical lines.
   const errorCounts = new Map<string, number>();
+  const noteError = (message: string): void => {
+    errorCounts.set(message, (errorCounts.get(message) ?? 0) + 1);
+  };
   let refreshed = 0;
   let deferred = 0;
 
@@ -485,7 +493,7 @@ export async function lookupProducts(options: {
   // path asks OSV in a single batch request no matter how many products it carries, so it can take
   // the whole inventory at once and never defers work to a later run.
   const budget = keyed
-    ? Math.max(1, Math.round(config.settings.nvdProductsPerRun))
+    ? Math.max(1, Math.round(settings.nvdProductsPerRun))
     : Math.max(1, names.length);
 
   const stale = names.filter(({ name }) => {
@@ -498,9 +506,20 @@ export async function lookupProducts(options: {
   });
 
   if (keyed) {
-    const due = stale.slice(0, budget);
+    // KEV-priority first, then whatever order the inventory produced; the slice below is the
+    // count budget, the time budget is checked inside the worker loop.
+    const queue = options.priority
+      ? [...stale].sort((a, b) => Number(options.priority?.has(b.name)) - Number(options.priority?.has(a.name)))
+      : [...stale];
+    const due = queue.slice(0, budget);
     deferred = stale.length - due.length;
-    for (const { name, wanted } of due) {
+
+    const throttle = new NvdThrottle(
+      Math.max(100, Math.round((settings.nvdWindowMs ?? 30_000) / Math.max(1, settings.nvdRatePerWindow ?? 50))),
+      offline,
+    );
+
+    const runOne = async ({ name, wanted }: { name: string; wanted: Set<string> }): Promise<void> => {
       const prev = cache.get(name);
       const since = options.force ? null : (prev?.last_modified ?? null);
       const res = await nvdProductQuery(http, {
@@ -508,12 +527,18 @@ export async function lookupProducts(options: {
         wanted,
         key: keyState.key,
         sinceModified: since,
-        maxPages: Math.max(1, Math.round(config.settings.nvdMaxPages)),
+        maxPages: Math.max(1, Math.round(settings.nvdMaxPages)),
+        throttle,
       });
-      if (res.records.length === 0 && res.error) {
-        errorCounts.set(res.error, (errorCounts.get(res.error) ?? 0) + 1);
-        continue;
+      if (res.status === 429) {
+        // The whole queue pauses on this answer (Retry-After wins over the exponential backoff).
+        throttle.rateLimited(res.retryAfterMs);
       }
+      if (res.records.length === 0 && res.error) {
+        noteError(res.error);
+        return;
+      }
+      throttle.succeeded();
       // Incremental answers only add and update; a full one (no `since`) also drops CVEs the
       // product stopped being mentioned in.
       const merged = mergeRecords(prev?.records ?? [], res.records, since === null);
@@ -526,7 +551,32 @@ export async function lookupProducts(options: {
         truncated: res.truncated,
       });
       refreshed += 1;
-      if (name !== due[due.length - 1]?.name) await sleep(rateLimitMs(true));
+    };
+
+    const startedAt = Date.now();
+    const budgetMs = Math.max(1_000, Math.round(settings.nvdCallBudgetMs ?? 20_000));
+    const concurrency = Math.max(1, Math.round(settings.nvdConcurrency ?? 1));
+    const work = [...due];
+
+    // One call must never block until the last product: the workers stop at the time budget and
+    // the rest drains in the background, so the MCP transport sees an answer well before a client
+    // timeout while the warm-up keeps going (task 1).
+    const worker = async (): Promise<void> => {
+      while (work.length > 0 && (offline || Date.now() - startedAt < budgetMs)) {
+        const item = work.shift();
+        if (item) await runOne(item);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, work.length) }, () => worker()));
+
+    if (work.length > 0) {
+      if (offline) {
+        // Offline there is nothing to wait for; the products that did not fit the loop are simply
+        // deferred and the tests keep their deterministic counts.
+        deferred += work.length;
+      } else {
+        warmUp(cacheDir, cache, work, runOne);
+      }
     }
   } else {
     // Keyless: one OSV batch for everything. OSV rejects a query without a version or commit —
@@ -603,6 +653,46 @@ export async function lookupProducts(options: {
       ),
     },
   };
+}
+
+/**
+ * The NVD walks that are still draining in the background after their `check_cves` call answered.
+ *
+ * Keyed by cache directory, so a second call while a warm-up runs sees it is running (and the
+ * products it holds are not double-fetched: the drain owns the `due` array alone). One drain per
+ * directory at a time; a fresh call's own slice is the intersection-free part.
+ */
+const warmUps = new Set<string>();
+
+/** Whether a background drain is running for this cache directory. */
+export function warmUpActive(cacheDir: string): boolean {
+  return warmUps.has(cacheDir);
+}
+
+/**
+ * Continues a keyed queue after the call answered: processes the products the time budget left
+ * (and a later call's slice sees them as fresh once saved), then persists the cache once. Failures
+ * inside the drain follow the same rules as inside the call: a transient failure leaves the
+ * product without an entry, so a later run asks again.
+ */
+function warmUp(
+  cacheDir: string,
+  cache: ProductCache,
+  work: { name: string; wanted: Set<string> }[],
+  runOne: (item: { name: string; wanted: Set<string> }) => Promise<void>,
+): void {
+  warmUps.add(cacheDir);
+  void (async () => {
+    try {
+      while (work.length > 0) {
+        const item = work.shift();
+        if (item) await runOne(item);
+      }
+    } finally {
+      warmUps.delete(cacheDir);
+      cache.save();
+    }
+  })();
 }
 
 /**

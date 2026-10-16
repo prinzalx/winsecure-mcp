@@ -9,6 +9,13 @@ export interface CachedFetch {
   /** Fetch timestamp in ISO-8601 UTC, from the cache entry. */
   fetched_at: string | null;
   error?: string;
+  /**
+   * HTTP status of a failed network attempt, when one was made. Since v0.6.3 the product lookup
+   * classifies failures (429 vs 404 vs 5xx), which the error text alone could not carry reliably.
+   */
+  status?: number;
+  /** `Retry-After` of a 429 answer in milliseconds, when NVD sent the header. */
+  retryAfterMs?: number;
 }
 
 export interface BinaryFetch {
@@ -108,6 +115,16 @@ interface CacheFile {
   [url: string]: { body: string; fetched_at: string };
 }
 
+/** Parse a `Retry-After` header (seconds or HTTP-date) into milliseconds; `undefined` when absent. */
+export function readRetryAfterMs(headers: Headers): number | undefined {
+  const raw = headers.get("retry-after");
+  if (raw === null) return undefined;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return Math.max(0, Math.round(seconds * 1000));
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined;
+}
+
 function safeName(url: string): string {
   let h = 2166136261;
   for (let i = 0; i < url.length; i += 1) {
@@ -172,8 +189,9 @@ export function createHttp(cacheDir: string, timeoutMs: number): Http {
             return { body: entry.body, from: "network", fetched_at: entry.fetched_at };
           }
           const detail = `HTTP ${String(res.status)}`;
-          if (cached) return { body: cached.body, from: "stale_cache", fetched_at: cached.fetched_at, error: detail };
-          return { body: null, from: "none", fetched_at: null, error: detail };
+          const retryAfterMs = readRetryAfterMs(res.headers);
+          if (cached) return { body: cached.body, from: "stale_cache", fetched_at: cached.fetched_at, error: detail, status: res.status, retryAfterMs };
+          return { body: null, from: "none", fetched_at: null, error: detail, status: res.status, retryAfterMs };
         } catch (cause) {
           const message = cause instanceof Error ? cause.message : String(cause);
           if (cached) {

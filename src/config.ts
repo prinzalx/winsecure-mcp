@@ -55,6 +55,24 @@ export interface Settings {
   nvdProductsPerRun: number;
   /** Page cap per product query, so a huge product (Chrome) cannot turn into 60 requests. */
   nvdMaxPages: number;
+  /**
+   * NVD requests allowed per window in keyed mode (NVD's documented keyed window is 50 per 30 s).
+   * The requests of a run are spaced to `nvdWindowMs / nvdRatePerWindow` apart instead of bursting,
+   * because the live beta showed a parallel salvo eating HTTP 429 on almost every product.
+   */
+  nvdRatePerWindow: number;
+  /** The window `nvdRatePerWindow` counts against, in milliseconds. */
+  nvdWindowMs: number;
+  /** Requests issued at the same time against NVD. One is the safe default; the queue honors a pause as a whole. */
+  nvdConcurrency: number;
+  /**
+   * Wall-clock budget of the per-product NVD walk inside one `check_cves` call. When it runs out,
+   * the call returns its partial answer and the rest of the queue continues in the background, so
+   * a cold keyed start never blocks long enough to trip a client-side transport timeout.
+   */
+  nvdCallBudgetMs: number;
+  /** How long a `not_found` (HTTP 404 with a valid NVD envelope) answer is trusted before a retry. */
+  nvdNotFoundTtlHours: number;
   /** Root paths never walked by the portable-app scan. */
   portableExcludes: string[];
   /** Maximum portable `.exe` hits kept before the result is cut (the paths are still reported). */
@@ -122,6 +140,11 @@ export function loadConfig(): ConfigStore {
     nvdApiKey: null,
     nvdProductsPerRun: 400,
     nvdMaxPages: 5,
+    nvdRatePerWindow: 50,
+    nvdWindowMs: 30_000,
+    nvdConcurrency: 1,
+    nvdCallBudgetMs: 20_000,
+    nvdNotFoundTtlHours: 6,
     portableExcludes: [...DEFAULT_EXCLUDES],
     portableMaxResults: 40,
     portableTimeoutMs: 60_000,
@@ -144,6 +167,11 @@ export function loadConfig(): ConfigStore {
     if (typeof file.nvdApiKey === "string" && file.nvdApiKey !== "") settings.nvdApiKey = file.nvdApiKey;
     settings.nvdProductsPerRun = num(file.nvdProductsPerRun, settings.nvdProductsPerRun);
     settings.nvdMaxPages = num(file.nvdMaxPages, settings.nvdMaxPages);
+    settings.nvdRatePerWindow = num(file.nvdRatePerWindow, settings.nvdRatePerWindow);
+    settings.nvdWindowMs = num(file.nvdWindowMs, settings.nvdWindowMs);
+    settings.nvdConcurrency = num(file.nvdConcurrency, settings.nvdConcurrency);
+    settings.nvdCallBudgetMs = num(file.nvdCallBudgetMs, settings.nvdCallBudgetMs);
+    settings.nvdNotFoundTtlHours = num(file.nvdNotFoundTtlHours, settings.nvdNotFoundTtlHours);
     if (Array.isArray(file.portableExcludes)) settings.portableExcludes = file.portableExcludes.map(String);
     settings.portableMaxResults = num(file.portableMaxResults, settings.portableMaxResults);
     settings.portableTimeoutMs = num(file.portableTimeoutMs, settings.portableTimeoutMs);

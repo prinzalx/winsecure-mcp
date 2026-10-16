@@ -120,6 +120,17 @@ interface ProductCacheEntry {
    * as "no results" must not silence a product for a whole day.
    */
   not_found_at?: string | null;
+  /**
+   * Where this product stands in the work queue (v0.6.5, task 1). This is the persisted position
+   * the next `check_cves` continues from: `done` and `not_found` are closed, `pending` and
+   * `failed_transient` stay open, and the last attempt time decides the queue slot so a product
+   * that just failed moves to the back instead of starting the next run at the front again.
+   */
+  state?: "pending" | "done" | "not_found" | "failed_transient";
+  /** ISO timestamp of the last network attempt (success or failure). */
+  last_attempt_at?: string | null;
+  /** How often this product was asked NVD directly; failure counter for the log. */
+  attempts?: number;
 }
 
 interface ProductCacheFile {
@@ -147,17 +158,51 @@ export interface ProductLookupStats {
   /** Products whose lookup ended in HTTP 429 (the rate limit was hit). */
   failed_429: number;
   /**
-   * Products whose lookup ended in HTTP 404. With a key set NVD answers 404 flakily (observed
-   * live: an empty body with `Invalid parameter: apiKey.`), so a 404 is a transient failure here,
-   * not a "no such CVE" statement, and never cached as one.
+   * Products whose lookup ended in an HTTP 404 that was NOT an NVD envelope (empty or foreign
+   * body — the key-flakiness / Cloudflare shape). A 404 whose body IS an NVD envelope is the real
+   * "zero matches" answer and lands in `not_found` instead (v0.6.5); it is a statement about the
+   * product, not a failure, and never counted as an enrichment.
    */
   failed_404: number;
   /** Products whose lookup failed for another transient reason (5xx, timeout, network, offline). */
   failed_other: number;
-  /** Products freshly answered with a negative (zero results) entry this run. */
+  /** Products freshly answered with a negative (zero matches) entry this run, counted apart from failures. */
   not_found: number;
   /** True when the per-call time budget ran out and the queue drain continues in the background. */
   warm_up_running: boolean;
+}
+
+/**
+ * The outcome of asking NVD about one product, used by both the `check_cves` walk and the idle
+ * drain (v0.6.5) so the two share exactly one classification.
+ */
+type ProductOutcome = "done" | "not_found" | "failed_429" | "failed_404" | "failed_other";
+
+/**
+ * Parse the body of a failed NVD answer as an NVD envelope (task 2, v0.6.5).
+ *
+ * Verified against the live endpoint on 2026-10-16 with curl against exactly the URLs this server
+ * builds (`keywordSearch` + paging + optional `apiKey`):
+ * - an unknown keyword WITHOUT a key answered `HTTP 200` with `totalResults: 0` — a genuine zero
+ *   match is an envelope, not a 404;
+ * - any keyword with a rejected or not-yet-activated key answered `HTTP 404` with an EMPTY body
+ *   (the live beta logged the `Invalid parameter: apiKey.` variant of the same answer);
+ * - Cloudflare's burst ban answered `HTTP 429` with the plain body `error code: 1015` and
+ *   `Retry-After: 0`.
+ * So a 404 is only a real "no match" when its body is an NVD envelope; an empty or foreign body
+ * (key flakiness, Cloudflare error page) is transient and must be retried, never cached away.
+ */
+function nvdErrorEnvelope(bodyText: string | undefined): { totalResults?: number } | null {
+  if (!bodyText) return null;
+  try {
+    const parsed = JSON.parse(bodyText) as { totalResults?: unknown; vulnerabilities?: unknown };
+    if (parsed && typeof parsed === "object" && (typeof parsed.totalResults === "number" || Array.isArray(parsed.vulnerabilities))) {
+      return parsed as { totalResults?: number };
+    }
+  } catch {
+    // Not JSON: an NVD/Cloudflare error page, not an envelope.
+  }
+  return null;
 }
 
 /**
@@ -206,15 +251,23 @@ class ProductCache {
     if (force) return false;
     const entry = this.get(name);
     if (!entry) return false;
+    // A transient failure is not an answer (v0.6.5): the persisted state keeps the product open
+    // in the queue, so its entry must never count fresh no matter what its timestamps say.
+    if (entry.state === "failed_transient" || entry.state === "pending") return false;
     if (keyed && entry.source !== "nvd") return false;
     const at = entry.not_found_at ?? entry.fetched_at;
     const age = Date.now() - Date.parse(at);
     if (!Number.isFinite(age) || age < 0) return false;
-    return age < (entry.not_found_at ? Math.min(ttlMs, notFoundTtlMs) : ttlMs);
+    // A genuine negative gets its own (longer, since v0.6.5) TTL rather than the lesser of the
+    // two: the 7-day not-found trust must not be cut back to the feed TTL.
+    return age < (entry.not_found_at ? notFoundTtlMs : ttlMs);
   }
 
+  /** Entries that carry an answer; open queue items (pending/failed) do not count as cached. */
   get size(): number {
-    return Object.keys(this.data.products).length;
+    return Object.values(this.data.products).filter(
+      (p) => p.state !== "failed_transient" && p.state !== "pending",
+    ).length;
   }
 
   names(): string[] {
@@ -227,9 +280,30 @@ class ProductCache {
     return newest;
   }
 
+  /**
+   * Writes the cache, keeping entries a concurrent writer (the idle drain, v0.6.5) answered more
+   * recently than this instance last saw: the file is re-read and the newer side of every product
+   * wins, so a call's save can never clobber a drain answer that arrived while it ran.
+   */
   save(): void {
     try {
       mkdirSync(join(this.file, ".."), { recursive: true });
+      let onDisk: Record<string, ProductCacheEntry> | null = null;
+      try {
+        const raw = JSON.parse(readFileSync(this.file, "utf8")) as Partial<ProductCacheFile>;
+        if (raw && typeof raw.products === "object" && raw.products !== null) {
+          onDisk = raw.products as Record<string, ProductCacheEntry>;
+        }
+      } catch {
+        onDisk = null;
+      }
+      if (onDisk) {
+        const stamp = (e: ProductCacheEntry | undefined): string => e?.last_attempt_at ?? e?.fetched_at ?? "";
+        for (const [key, entry] of Object.entries(onDisk)) {
+          const mine = this.data.products[key];
+          if (!mine || stamp(entry) > stamp(mine)) this.data.products[key] = entry;
+        }
+      }
       writeFileSync(this.file, JSON.stringify(this.data), "utf8");
     } catch {
       // An unwritable cache costs the next run its fetches, nothing more.
@@ -388,6 +462,8 @@ async function nvdProductQuery(
   /** HTTP status of the failed request, when one failed (used for the failure classes). */
   status?: number;
   retryAfterMs?: number;
+  /** Body of the failed request, when there was one (a 404's envelope decides its class, v0.6.5). */
+  bodyText?: string;
 }> {
   const collected: CveRecord[] = [];
   let lastModified: string | null = null;
@@ -414,7 +490,15 @@ async function nvdProductQuery(
     const res = await http.get(`${NVD_API}?${params.toString()}`, 0);
     if (!res.body) {
       error = res.error ?? "no answer";
-      return { records: collected, lastModified, truncated: page > 0, error, status: res.status, retryAfterMs: res.retryAfterMs };
+      return {
+        records: collected,
+        lastModified,
+        truncated: page > 0,
+        error,
+        status: res.status,
+        retryAfterMs: res.retryAfterMs,
+        bodyText: res.bodyText,
+      };
     }
     let parsed: { totalResults?: number; vulnerabilities?: { cve?: NvdCveJson }[] };
     try {
@@ -479,6 +563,265 @@ export function osvCveId(advisoryId: string): string | null {
   const m = /(CVE-\d{4}-\d{4,})/i.exec(advisoryId);
   const id = m?.[1];
   return id ? id.toUpperCase() : null;
+}
+
+// ---------------------------------------------------------------------------
+// The shared NVD queue (v0.6.5)
+// ---------------------------------------------------------------------------
+
+/**
+ * The persistent work queue of keyed NVD lookups, one per cache directory.
+ *
+ * The field runs showed what a per-call queue was not: seven runs over two hours each started at
+ * the same front products (7-zip, git, edge, whatsapp), ate 429/404 there, and the ~400 products
+ * behind them never came to word. So the position lives here instead — insertion order is
+ * processing order, a product that fails is re-appended at the back (round-robin, so a permanent
+ * failure cannot block the queue), and every `check_cves` continues where the queue stands
+ * instead of starting over. The idle-drain timer works the same map between calls.
+ */
+interface NvdQueueItem {
+  name: string;
+  wanted: Set<string>;
+}
+
+interface NvdQueue {
+  /** Normalised name -> item, in insertion order (= processing order). */
+  items: Map<string, NvdQueueItem>;
+  throttle: NvdThrottle;
+  /** The interval spacing the throttle was built from, so a config change rebuilds it. */
+  throttleIntervalMs: number;
+  /** Timer of the idle drain; `null` when no drain is armed. */
+  timer: ReturnType<typeof setInterval> | null;
+  /** True while a drain tick is working the queue, so ticks never overlap. */
+  busy: boolean;
+}
+
+const nvdQueues = new Map<string, NvdQueue>();
+
+/** The drain bindings per cache directory, so a tick re-reads config (hot key changes, v0.6.5). */
+const drainBindings = new Map<string, IdleDrainBinding>();
+
+/** What the idle-drain timer needs to work the queue without a `check_cves` call running. */
+export interface IdleDrainBinding {
+  http: Http;
+  config: ConfigStore;
+  cacheDir: string;
+  /** The current inventory's product names, re-read per tick so a scan feeds the drain. */
+  names: () => { name: string; wanted: Set<string>; version?: string | null }[];
+  ttlMs: number;
+  onStatus?: (product: string, status: number) => void;
+}
+
+
+function queueFor(cacheDir: string, settings: { nvdWindowMs?: number; nvdRatePerWindow?: number; nvdJitterPct?: number; nvdBackoffCapMs?: number }, offline: boolean): NvdQueue {
+  const interval = Math.max(100, Math.round((settings.nvdWindowMs ?? 30_000) / Math.max(1, settings.nvdRatePerWindow ?? 50)));
+  let q = nvdQueues.get(cacheDir);
+  if (q && q.throttleIntervalMs !== interval) q = undefined;
+  if (!q) {
+    const jitterPct = Math.min(100, Math.max(0, settings.nvdJitterPct ?? 20));
+    q = {
+      items: new Map(),
+      throttle: new NvdThrottle(interval, offline, Math.round((interval * jitterPct) / 100), settings.nvdBackoffCapMs ?? 60_000),
+      throttleIntervalMs: interval,
+      timer: null,
+      busy: false,
+    };
+    nvdQueues.set(cacheDir, q);
+  }
+  return q;
+}
+
+/** Whether the idle drain is armed or currently working this cache directory. */
+export function drainActive(cacheDir: string): boolean {
+  const q = nvdQueues.get(cacheDir);
+  return q !== undefined && (q.timer !== null || q.busy);
+}
+
+/**
+ * Ask NVD about one product and persist the outcome as state (task 1 + 2, v0.6.5).
+ *
+ * Writes the cache entry (state, timestamps, attempt counter) but does not save the file — the
+ * caller saves once per batch, so a walk of 400 products costs one write, not 400.
+ */
+async function askNvdProduct(
+  http: Http,
+  cache: ProductCache,
+  item: NvdQueueItem,
+  opts: {
+    key: string | null;
+    settings: { nvdMaxPages: number };
+    throttle: NvdThrottle;
+    force: boolean;
+  },
+  onStatus?: (product: string, status: number) => void,
+  /** Receives the concrete failure reason of every failed product (the aggregate `source_errors` line). */
+  onFail?: (message: string) => void,
+): Promise<ProductOutcome> {
+  const prev = cache.get(item.name);
+  const since = opts.force ? null : (prev?.not_found_at ? null : (prev?.last_modified ?? null));
+  const res = await nvdProductQuery(http, {
+    name: item.name,
+    wanted: item.wanted,
+    key: opts.key,
+    sinceModified: since,
+    maxPages: Math.max(1, Math.round(opts.settings.nvdMaxPages)),
+    throttle: opts.throttle,
+  });
+  const status = res.status ?? 0;
+  const attemptAt = new Date().toISOString();
+  const attempts = (prev?.attempts ?? 0) + 1;
+  const markFailed = (): void => {
+    cache.set(item.name, {
+      name: item.name,
+      records: prev?.records ?? [],
+      last_modified: prev?.last_modified ?? null,
+      fetched_at: prev?.fetched_at ?? attemptAt,
+      source: prev?.source ?? "nvd",
+      truncated: prev?.truncated ?? false,
+      not_found_at: null,
+      state: "failed_transient",
+      last_attempt_at: attemptAt,
+      attempts,
+    });
+  };
+
+  if (status === 429) {
+    // The whole queue pauses on this answer; the product stays open and is asked again later.
+    opts.throttle.rateLimited(res.retryAfterMs);
+    markFailed();
+    onStatus?.(item.name, 429);
+    onFail?.(res.error ?? "HTTP 429");
+    return "failed_429";
+  }
+  if (status === 404) {
+    const envelope = nvdErrorEnvelope(res.bodyText);
+    if (envelope) {
+      // A 404 that IS an NVD envelope is the answer "this product matches zero CVEs": a real
+      // negative with the not-found TTL, counted separately from failures, and explicitly not
+      // "enriched" — the product has no CVE records, it has a statement that it has none.
+      cache.set(item.name, {
+        name: item.name,
+        records: [],
+        last_modified: null,
+        fetched_at: attemptAt,
+        source: "nvd",
+        truncated: false,
+        not_found_at: attemptAt,
+        state: "not_found",
+        last_attempt_at: attemptAt,
+        attempts,
+      });
+      onStatus?.(item.name, 404);
+      return "not_found";
+    }
+    // Empty or foreign body: the key-flakiness / Cloudflare shape. Transient, retried later.
+    markFailed();
+    onStatus?.(item.name, 404);
+    onFail?.(res.error ?? "HTTP 404");
+    return "failed_404";
+  }
+  if (res.error && res.records.length === 0) {
+    markFailed();
+    onFail?.(res.error);
+    return "failed_other";
+  }
+  opts.throttle.succeeded();
+  // Incremental answers only add and update; a full one (no `since`) also drops CVEs the
+  // product stopped being mentioned in. A full answer with zero results is a negative marker
+  // with the not-found TTL, not a day-fresh "done".
+  const merged = mergeRecords(prev?.records ?? [], res.records, since === null);
+  cache.set(item.name, {
+    name: item.name,
+    records: merged,
+    last_modified: res.lastModified ?? prev?.last_modified ?? null,
+    fetched_at: attemptAt,
+    source: "nvd",
+    truncated: res.truncated,
+    not_found_at: merged.length === 0 ? attemptAt : null,
+    state: merged.length === 0 ? "not_found" : "done",
+    last_attempt_at: attemptAt,
+    attempts,
+  });
+  return merged.length === 0 ? "not_found" : "done";
+}
+
+/** One drain tick: work at most `batch` open products, failures back to the queue's tail. */
+async function drainBatch(cacheDir: string, batch: number): Promise<void> {
+  const binding = drainBindings.get(cacheDir);
+  const q = nvdQueues.get(cacheDir);
+  if (!binding || !q || q.busy) return;
+  if (q.items.size === 0) {
+    stopIdleDrain(cacheDir);
+    return;
+  }
+  if (process.env.WSMD_OFFLINE === "1") return;
+  const keyState = resolveNvdKey(binding.config);
+  if (keyState.key === null) {
+    // Key removed while the server runs: the drain stops cleanly (task 3), and saving a key
+    // re-arms it without a restart.
+    stopIdleDrain(cacheDir);
+    return;
+  }
+  q.busy = true;
+  try {
+    const cache = new ProductCache(cacheDir);
+    const settings = binding.config.settings;
+    let done = 0;
+    while (done < batch && q.items.size > 0) {
+      const head = q.items.entries().next();
+      if (head.done === true) break;
+      const [key, item] = head.value;
+      q.items.delete(key);
+      done += 1;
+      const outcome = await askNvdProduct(binding.http, cache, item, {
+        key: keyState.key,
+        settings,
+        throttle: q.throttle,
+        force: false,
+      }, binding.onStatus);
+      if (outcome === "failed_429" || outcome === "failed_404" || outcome === "failed_other") {
+        q.items.set(key, item); // round-robin: the failure waits at the back again
+      }
+    }
+    cache.save();
+  } finally {
+    q.busy = false;
+  }
+  if (q.items.size === 0) stopIdleDrain(cacheDir);
+}
+
+
+function armIdleTimer(cacheDir: string, periodMs: number): void {
+  const q = nvdQueues.get(cacheDir);
+  if (!q || q.timer !== null) return;
+  q.timer = setInterval(
+    () => void drainBatch(cacheDir, drainBindings.get(cacheDir)?.config.settings.nvdIdleDrainBatch ?? 5),
+    Math.max(5_000, periodMs),
+  );
+  // The MCP stdio transport keeps the process alive; the drain must not hold it open on its own.
+  q.timer.unref?.();
+}
+
+/**
+ * Arm the server-side idle drain (task 3, v0.6.5).
+ *
+ * The field runs showed the background warm-up only ever advanced inside a `check_cves` call's
+ * time budget: between calls there were zero NVD requests. The timer works the shared queue on its
+ * own while products remain open; `check_cves` re-arms it after every call, and removing the key
+ * stops it.
+ */
+export function startIdleDrain(binding: IdleDrainBinding): void {
+  drainBindings.set(binding.cacheDir, binding);
+  armIdleTimer(binding.cacheDir, binding.config.settings.nvdIdleDrainMs ?? 30_000);
+}
+
+/** Stop the idle drain (shutdown, key removal, or an empty queue). */
+export function stopIdleDrain(cacheDir: string): void {
+  const q = nvdQueues.get(cacheDir);
+  if (q?.timer) {
+    clearInterval(q.timer);
+    q.timer = null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -547,7 +890,7 @@ export async function lookupProducts(options: {
   let notFound = 0;
 
   // Defensive defaults, so a config written before v0.6.3 (or a minimal test config) still paces.
-  const notFoundTtlMs = (settings.nvdNotFoundTtlHours ?? 6) * 60 * 60 * 1000;
+  const notFoundTtlMs = (settings.nvdNotFoundTtlHours ?? 168) * 60 * 60 * 1000;
 
   // Keyed mode is the only one that walks NVD per product, so the budget protects it. The keyless
   // path asks OSV in a single batch request no matter how many products it carries, so it can take
@@ -559,96 +902,88 @@ export async function lookupProducts(options: {
   const stale = names.filter(({ name }) => !cache.isFresh(name, options.ttlMs, keyed, notFoundTtlMs, options.force));
 
   if (keyed) {
-    // KEV-priority first, then whatever order the inventory produced; the slice below is the
-    // count budget, the time budget is checked inside the worker loop.
-    const queue = options.priority
-      ? [...stale].sort((a, b) => Number(options.priority?.has(b.name)) - Number(options.priority?.has(a.name)))
-      : [...stale];
-    const due = queue.slice(0, budget);
-    deferred = stale.length - due.length;
+    // The shared queue (task 1, v0.6.5): synced with the current inventory, KEV products moved to
+    // the front, and — the point of the whole change — NOT rebuilt from the inventory order every
+    // call. A product that just failed sits at the back, so seven runs in a row no longer start
+    // at the same four names while 400 products never come to word.
+    const q = queueFor(cacheDir, settings, offline);
+    for (const item of names) {
+      const key = normName(item.name);
+      if (cache.isFresh(item.name, options.ttlMs, true, notFoundTtlMs, options.force)) {
+        q.items.delete(key);
+      } else if (!q.items.has(key)) {
+        q.items.set(key, { name: item.name, wanted: item.wanted });
+      }
+    }
+    if (options.priority && options.priority.size > 0) {
+      const prio: [string, NvdQueueItem][] = [];
+      const rest: [string, NvdQueueItem][] = [];
+      for (const entry of q.items) (options.priority.has(entry[0]) ? prio : rest).push(entry);
+      q.items = new Map([...prio, ...rest]);
+    }
 
-    const throttle = new NvdThrottle(
-      Math.max(100, Math.round((settings.nvdWindowMs ?? 30_000) / Math.max(1, settings.nvdRatePerWindow ?? 50))),
-      offline,
-    );
-
-    const runOne = async ({ name, wanted }: { name: string; wanted: Set<string> }): Promise<void> => {
-      const prev = cache.get(name);
-      const since = options.force ? null : (prev?.not_found_at ? null : (prev?.last_modified ?? null));
-      const res = await nvdProductQuery(http, {
-        name,
-        wanted,
-        key: keyState.key,
-        sinceModified: since,
-        maxPages: Math.max(1, Math.round(settings.nvdMaxPages)),
-        throttle,
-      });
-      const status = res.status ?? 0;
-      if (status === 429) {
-        // The whole queue pauses on this answer; the product keeps no cache entry and is asked
-        // again on the next run (a transient failure is not done, task 2).
-        throttle.rateLimited(res.retryAfterMs);
-        failed429 += 1;
-        noteError(res.error ?? "HTTP 429");
-        options.onStatus?.(name, 429);
-        return;
-      }
-      if (status === 404) {
-        // With a key set, NVD answers 404 flakily (observed live: empty body, `Invalid parameter:
-        // apiKey.`), so it counts as transient and is retried next run — caching it as "no CVEs"
-        // is what made the 404 totals jump 17→12→3→35 between runs.
-        failed404 += 1;
-        noteError(res.error ?? "HTTP 404");
-        options.onStatus?.(name, 404);
-        return;
-      }
-      if (res.error && res.records.length === 0) {
-        failedOther += 1;
-        noteError(res.error);
-        return;
-      }
-      throttle.succeeded();
-      // Incremental answers only add and update; a full one (no `since`) also drops CVEs the
-      // product stopped being mentioned in. A full answer with zero results is a negative marker
-      // with the short not-found TTL, not a day-fresh "done".
-      const merged = mergeRecords(prev?.records ?? [], res.records, since === null);
-      cache.set(name, {
-        name,
-        records: merged,
-        last_modified: res.lastModified ?? prev?.last_modified ?? null,
-        fetched_at: new Date().toISOString(),
-        source: "nvd",
-        truncated: res.truncated,
-        not_found_at: merged.length === 0 ? new Date().toISOString() : null,
-      });
-      if (merged.length === 0) notFound += 1;
-      refreshed += 1;
-    };
+    // The count budget takes the queue's head; the items are removed here and put back at the
+    // tail below if they are still open, which is exactly the round-robin a failed product needs.
+    const due = [...q.items.entries()].slice(0, budget).map(([key, item]) => {
+      q.items.delete(key);
+      return { key, item };
+    });
 
     const startedAt = Date.now();
     const budgetMs = Math.max(1_000, Math.round(settings.nvdCallBudgetMs ?? 20_000));
     const concurrency = Math.max(1, Math.round(settings.nvdConcurrency ?? 1));
     const work = [...due];
 
+    const runOne = async (item: NvdQueueItem): Promise<void> => {
+      const outcome = await askNvdProduct(http, cache, item, {
+        key: keyState.key,
+        settings,
+        throttle: q.throttle,
+        force: options.force,
+      }, options.onStatus, noteError);
+      switch (outcome) {
+        case "failed_429":
+          failed429 += 1;
+          break;
+        case "failed_404":
+          failed404 += 1;
+          break;
+        case "failed_other":
+          failedOther += 1;
+          break;
+        case "not_found":
+          notFound += 1;
+          refreshed += 1;
+          break;
+        case "done":
+          refreshed += 1;
+          break;
+      }
+    };
+
     // One call must never block until the last product: the workers stop at the time budget and
-    // the rest drains in the background, so the MCP transport sees an answer well before a client
-    // timeout while the warm-up keeps going (task 1).
+    // the rest stays in the queue for the idle drain, so the MCP transport sees an answer well
+    // before a client timeout while the warm-up keeps going outside the call (task 3).
     const worker = async (): Promise<void> => {
       while (work.length > 0 && (offline || Date.now() - startedAt < budgetMs)) {
-        const item = work.shift();
-        if (item) await runOne(item);
+        const next = work.shift();
+        if (next) await runOne(next.item);
       }
     };
     await Promise.all(Array.from({ length: Math.min(concurrency, work.length) }, () => worker()));
 
-    if (work.length > 0) {
-      if (offline) {
-        // Offline there is nothing to wait for; the products that did not fit the loop are simply
-        // deferred and the tests keep their deterministic counts.
-        deferred += work.length;
-      } else {
-        warmUp(cacheDir, cache, work, runOne);
-      }
+    // Closed outcomes stay out of the queue; open ones (failures included, and the items the
+    // time budget never reached) go to the back, so both the idle drain and the next call
+    // continue where this one stopped rather than starting over at the same names.
+    for (const { key, item } of due) {
+      const entry = cache.get(item.name);
+      if (entry?.state !== "done" && entry?.state !== "not_found") q.items.set(key, item);
+    }
+    deferred = q.items.size;
+
+    if (!offline && q.items.size > 0 && drainBindings.has(cacheDir)) {
+      // The call answered; from here the server timer keeps the queue draining between calls.
+      armIdleTimer(cacheDir, settings.nvdIdleDrainMs ?? 30_000);
     }
   } else {
     // Keyless: one OSV batch for everything. OSV rejects a query without a version or commit —
@@ -731,49 +1066,9 @@ export async function lookupProducts(options: {
       failed_404: failed404,
       failed_other: failedOther,
       not_found: notFound,
-      warm_up_running: warmUpActive(cacheDir),
+      warm_up_running: drainActive(cacheDir),
     },
   };
-}
-
-/**
- * The NVD walks that are still draining in the background after their `check_cves` call answered.
- *
- * Keyed by cache directory, so a second call while a warm-up runs sees it is running (and the
- * products it holds are not double-fetched: the drain owns the `due` array alone). One drain per
- * directory at a time; a fresh call's own slice is the intersection-free part.
- */
-const warmUps = new Set<string>();
-
-/** Whether a background drain is running for this cache directory. */
-export function warmUpActive(cacheDir: string): boolean {
-  return warmUps.has(cacheDir);
-}
-
-/**
- * Continues a keyed queue after the call answered: processes the products the time budget left
- * (and a later call's slice sees them as fresh once saved), then persists the cache once. Failures
- * inside the drain follow the same rules as inside the call: a transient failure leaves the
- * product without an entry, so a later run asks again.
- */
-function warmUp(
-  cacheDir: string,
-  cache: ProductCache,
-  work: { name: string; wanted: Set<string> }[],
-  runOne: (item: { name: string; wanted: Set<string> }) => Promise<void>,
-): void {
-  warmUps.add(cacheDir);
-  void (async () => {
-    try {
-      while (work.length > 0) {
-        const item = work.shift();
-        if (item) await runOne(item);
-      }
-    } finally {
-      warmUps.delete(cacheDir);
-      cache.save();
-    }
-  })();
 }
 
 /**

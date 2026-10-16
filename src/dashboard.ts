@@ -56,6 +56,12 @@ export interface DashboardState {
   cve: {
     mode: string | null;
     key_present: boolean;
+    /**
+     * What NVD says about the key: `valid`, `rejected` or `unknown` (v0.6.6). Kept apart from
+     * `key_present`, because a saved key that NVD refuses is present but useless — the earlier
+     * green icon over exactly that state is what sent users chasing phantom results.
+     */
+    key_valid: "valid" | "rejected" | "unknown";
     key_source: string | null;
     /** Saved key shortened for display, so the dashboard field can show it as its own default. */
     key_masked: string | null;
@@ -143,7 +149,7 @@ export function computeState(options: {
   tools: ToolDefinition[];
   activity: ActivityEntry[];
   clientSampling: boolean | null;
-  nvdKey: { present: boolean; source: string | null; masked?: string | null };
+  nvdKey: { present: boolean; source: string | null; masked?: string | null; valid?: "valid" | "rejected" | "unknown" };
 }): DashboardState {
   const { store } = options;
 
@@ -186,6 +192,7 @@ export function computeState(options: {
     cve: {
       mode: store.cve_mode ?? null,
       key_present: options.nvdKey.present,
+      key_valid: options.nvdKey.valid ?? "unknown",
       key_source: options.nvdKey.source,
       key_masked: options.nvdKey.masked ?? null,
     },

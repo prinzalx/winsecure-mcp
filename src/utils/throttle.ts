@@ -33,13 +33,23 @@ export class NvdThrottle {
   private streak = 0;
 
   constructor(
-    private readonly intervalMs: number,
+    private intervalMs: number,
     private readonly offline = false,
     /** Extra randomised spacing per request, so a drained queue does not leave its pause as a salvo. */
     private readonly jitterMs = 0,
     /** Upper bound of the exponential backoff; a wrong guess is a config change, not a release. */
     private readonly backoffCapMs = 60_000,
   ) {}
+
+  /**
+   * Move the spacing to a new interval without losing the pause (v0.6.6).
+   *
+   * A rejected key paces the same queue at the keyless window; rebuilding the throttle would drop
+   * the long pause the rejection just set, which is the one thing the retry storm needs.
+   */
+  setIntervalMs(ms: number): void {
+    this.intervalMs = ms;
+  }
 
   /** Wait until the next request may go out, then take its slot. */
   async acquire(): Promise<void> {
@@ -68,6 +78,26 @@ export class NvdThrottle {
 
   /** A answered request breaks the 429 streak, so the backoff shrinks again. */
   succeeded(): void {
+    this.streak = 0;
+  }
+
+  /**
+   * Pause the whole queue for a fixed stretch, independent of the 429 backoff (v0.6.6).
+   *
+   * The circuit breaker and a rejected key use this: the point is that nothing goes out at all for
+   * a while, so a request shape NVD never accepts stops burning the window on retries.
+   */
+  pauseFor(ms: number): void {
+    if (this.offline) return;
+    const until = Date.now() + Math.max(0, ms);
+    if (until > this.pausedUntil) this.pausedUntil = until;
+    if (this.pausedUntil > this.nextSlotAt) this.nextSlotAt = this.pausedUntil;
+  }
+
+  /** Lift every pause (a probe proved the key good again): the queue may run at slot spacing. */
+  resume(): void {
+    this.pausedUntil = 0;
+    if (this.nextSlotAt < Date.now()) this.nextSlotAt = 0;
     this.streak = 0;
   }
 

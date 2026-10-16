@@ -123,6 +123,11 @@
       .keyrow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
       .pill.mode-keyed { color: var(--green); border-color: var(--green); }
       .pill.mode-keyless { color: var(--yellow); border-color: var(--yellow); }
+      /* The key pill's three states (v0.6.6): green only for a key NVD accepted, yellow for a
+         present-but-unproven key, red for one NVD rejected. Presence alone must never look green. */
+      .pill.key-valid { color: var(--green); border-color: var(--green); }
+      .pill.key-unknown { color: var(--yellow); border-color: var(--yellow); }
+      .pill.key-rejected { color: var(--red); border-color: var(--red); }
       footer { color: var(--muted); font-size: 12px; margin-top: 36px; }
       #runlog {
         margin-top: 10px;
@@ -209,12 +214,23 @@
           `v${state.version} · ${state.store_exists ? "store present" : "no scan stored yet"}` +
           ` · client sampling ${state.client_sampling === null ? "— no client yet" : state.client_sampling ? "yes" : "no"}`;
 
-        const cve = state.cve ?? { mode: null, key_present: false, key_source: null, key_masked: null };
+        const cve = state.cve ?? { mode: null, key_present: false, key_valid: "unknown", key_source: null, key_masked: null };
         keyMasked = cve.key_masked ?? null;
         const modePill = `<span class="pill ${cve.mode === "nvd-keyed" ? "mode-keyed" : "mode-keyless"}">${esc(cve.mode ?? "no lookup yet")}</span>`;
+        // Green ONLY for a key NVD accepted. A key that is merely saved (or whose probe has not
+        // answered yet) is yellow; NVD refusing it is red, which is the state that used to hide
+        // behind a green "key set" pill while the whole product cache stayed empty.
+        const keyCls = !cve.key_present ? "mode-keyless" : cve.key_valid === "valid" ? "key-valid" : cve.key_valid === "rejected" ? "key-rejected" : "key-unknown";
+        const keyText = !cve.key_present
+          ? "no key"
+          : cve.key_valid === "rejected"
+            ? `key REJECTED by NVD (${esc(cve.key_source ?? "?")}${cve.key_masked ? ` · ${esc(cve.key_masked)}` : ""}) — lookups run keyless`
+            : cve.key_valid === "valid"
+              ? `key valid (${esc(cve.key_source ?? "?")}${cve.key_masked ? ` · ${esc(cve.key_masked)}` : ""})`
+              : `key set, unproven (${esc(cve.key_source ?? "?")}${cve.key_masked ? ` · ${esc(cve.key_masked)}` : ""})`;
         $("#nvdkey").innerHTML =
           `<div class="keyrow">${modePill}` +
-          `<span class="pill ${cve.key_present ? "mode-keyed" : "mode-keyless"}">${cve.key_present ? `key set (${esc(cve.key_source ?? "?")}${cve.key_masked ? ` · ${esc(cve.key_masked)}` : ""})` : "no key"}</span>` +
+          `<span class="pill ${keyCls}">${keyText}</span>` +
           `<input id="key-input" type="text" placeholder="paste a new NVD API key" autocomplete="off" value="${esc(keyDraft ?? keyMasked ?? "")}" />` +
           `<button id="btn-key">save</button>` +
           `<button id="btn-key-clear">clear</button>` +
@@ -331,7 +347,11 @@
           });
           const body = await res.json();
           if (res.ok) {
-            keyMsg = body.key_present ? `saved (${body.key_masked ?? ""}) — next check_cves runs nvd-keyed` : "cleared — running keyless";
+            keyMsg = !body.key_present
+              ? "cleared — running keyless"
+              : body.key_valid === "rejected"
+                ? `saved (${body.key_masked ?? ""}) but NVD rejected it — lookups run keyless until the key checks out`
+                : `saved (${body.key_masked ?? ""}) — next check_cves runs nvd-keyed`;
             // Drop the draft so the field falls back to the fresh masked key from the server.
             keyDraft = null;
           } else {

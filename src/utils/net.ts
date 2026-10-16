@@ -22,6 +22,15 @@ export interface CachedFetch {
    * error page, which the status code alone could not distinguish.
    */
   bodyText?: string;
+  /**
+   * Value of the `message` response header of a failed network attempt, when NVD sent one.
+   *
+   * Verified against the live endpoint on 2026-10-16: when the API rejects a request the body is
+   * EMPTY and the only thing that says why is this header (`Invalid parameter: apiKey.` for a key
+   * sent as a query parameter, `Invalid apiKey.` for a key value NVD does not accept). Without it
+   * every such rejection is indistinguishable from a real "zero matches" 404.
+   */
+  message?: string;
 }
 
 export interface BinaryFetch {
@@ -42,7 +51,7 @@ export interface Http {
    * expired entry exists, that stale entry is still returned, because a scan run must never depend
    * on the network. Only a cold cache plus no network yields `from: "none"`.
    */
-  get(url: string, ttlMs: number): Promise<CachedFetch>;
+  get(url: string, ttlMs: number, headers?: Record<string, string>): Promise<CachedFetch>;
   /**
    * Same rules as `get`, but for bytes. A ZIP read through `res.text()` loses its binary content,
    * so the cache entry of a binary url is stored base64-encoded under its own file.
@@ -174,7 +183,7 @@ export function createHttp(cacheDir: string, timeoutMs: number): Http {
 
   return {
     cacheDir,
-    async get(url, ttlMs) {
+    async get(url, ttlMs, headers) {
       const cached = readCache(url);
       if (cached) {
         const age = Date.now() - Date.parse(cached.fetched_at);
@@ -186,7 +195,7 @@ export function createHttp(cacheDir: string, timeoutMs: number): Http {
       if (!offline) {
         try {
           const res = await fetch(url, {
-            headers: { "user-agent": "winsecure-mcp/0.1", accept: "application/json" },
+            headers: { "user-agent": "winsecure-mcp/0.1", accept: "application/json", ...headers },
             signal: AbortSignal.timeout(timeoutMs),
           });
           if (res.ok) {
@@ -197,8 +206,9 @@ export function createHttp(cacheDir: string, timeoutMs: number): Http {
           const detail = `HTTP ${String(res.status)}`;
           const retryAfterMs = readRetryAfterMs(res.headers);
           const bodyText = await res.text().catch(() => "");
-          if (cached) return { body: cached.body, from: "stale_cache", fetched_at: cached.fetched_at, error: detail, status: res.status, retryAfterMs, bodyText };
-          return { body: null, from: "none", fetched_at: null, error: detail, status: res.status, retryAfterMs, bodyText };
+          const message = res.headers.get("message") ?? undefined;
+          if (cached) return { body: cached.body, from: "stale_cache", fetched_at: cached.fetched_at, error: detail, status: res.status, retryAfterMs, bodyText, message };
+          return { body: null, from: "none", fetched_at: null, error: detail, status: res.status, retryAfterMs, bodyText, message };
         } catch (cause) {
           const message = cause instanceof Error ? cause.message : String(cause);
           if (cached) {

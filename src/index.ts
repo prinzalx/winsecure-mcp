@@ -9,7 +9,16 @@ import { fileURLToPath } from "node:url";
 
 import { ARGS, loadConfig } from "./config.js";
 import { computeState, createActivity, type Activity } from "./dashboard.js";
-import { startIdleDrain, stopIdleDrain, resolveNvdKey, validateNvdKey } from "./modules/cves/products.js";
+import {
+  startIdleDrain,
+  stopIdleDrain,
+  resolveNvdKey,
+  validateNvdKey,
+  looksLikeNvdKey,
+  recordKeyProbe,
+  nvdKeyHealth,
+  type NvdKeyStatus,
+} from "./modules/cves/products.js";
 import { productNames } from "./modules/cves/index.js";
 import { ALL_TOOLS, TOOLS_BY_NAME } from "./modules/index.js";
 import { openStore, storeExists, type DataStore } from "./store.js";
@@ -234,7 +243,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       tools: ALL_TOOLS,
       activity: activity.recent(20),
       clientSampling: attachedClientSampling,
-      nvdKey: { present: resolveNvdKey(config).key !== null, source: resolveNvdKey(config).source, masked: maskNvdKey(resolveNvdKey(config).key) },
+      nvdKey: {
+        present: resolveNvdKey(config).key !== null,
+        source: resolveNvdKey(config).source,
+        masked: maskNvdKey(resolveNvdKey(config).key),
+        // `key_present` alone once meant a green icon while every lookup failed on a bad key, so
+        // the validity is reported apart (v0.6.6): the GUI may only go green on `valid`.
+        valid: nvdKeyHealth(http.cacheDir).status,
+      },
     }));
   }
 
@@ -250,31 +266,56 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       if (candidate === "") {
         config.settings.nvdApiKey = null;
         config.save();
-        nvdKeyValidation = { valid: true, at: new Date().toISOString() };
+        nvdKeyValidation = { status: "unknown", at: new Date().toISOString() };
+        recordKeyProbe(http.cacheDir, { status: "unknown" });
         // Key removed: the drain must not keep querying keyed (v0.6.5). It also notices by
         // itself on the next tick; stopping here is the clean cut.
         stopIdleDrain(http.cacheDir);
         return send(200, { ok: true, key_present: false, mode: "keyless-osv+cached", key_masked: null });
       }
+      // A malformed candidate never reaches NVD and is refused outright (400): storing it would
+      // only reproduce the field problem of a present-but-useless key.
+      if (!looksLikeNvdKey(candidate)) {
+        process.stderr.write("  no valid NVD API key — check dashboard\n");
+        return send(400, {
+          ok: false,
+          error: "not a valid NVD key format (32 hex chars or a UUID)",
+          last_validation: { status: "rejected", error: "not a valid NVD key format (32 hex chars or a UUID)", at: new Date().toISOString() },
+        });
+      }
       const check = await validateNvdKey(candidate, config.settings.httpTimeoutMs);
-      // Both outcomes are recorded, so `last_validation` is never null after a save and the
+      // Every outcome is recorded, so `last_validation` is never null after a save and the
       // dashboard can show the reason where the user clicked.
       nvdKeyValidation = { ...check, at: new Date().toISOString() };
-      if (!check.valid) {
-        // The console contract: a failed validation says the same line the startup hint says.
-        process.stderr.write("  no valid NVD API key — check dashboard\n");
-        return send(400, { ok: false, error: check.error ?? "invalid key", last_validation: nvdKeyValidation });
-      }
+      // A key NVD rejected STILL saves (v0.6.6): the drain pauses keyed and continues keyless at
+      // the keyless limit, so a wrong key no longer means zero progress — and the saved value is
+      // what the next probe re-checks. Only a malformed key is refused before saving.
+      recordKeyProbe(http.cacheDir, check, config.settings.nvdBreakerPauseMs ?? 900_000);
       config.settings.nvdApiKey = candidate;
       config.save();
       // A saved key re-arms the drain without a restart, continuing the persisted queue (v0.6.5).
       armNvdDrain();
-      process.stderr.write(`  NVD API key saved — mode nvd-keyed (${maskNvdKey(candidate)})\n`);
-      return send(200, { ok: true, key_present: true, source: "config", mode: "nvd-keyed", key_masked: maskNvdKey(candidate) });
+      process.stderr.write(
+        check.status === "rejected"
+          ? `  NVD API key REJECTED — ${check.error ?? "NVD refused it"}; lookups fall back to keyless (${maskNvdKey(candidate)})\n`
+          : `  NVD API key saved — mode nvd-keyed (${maskNvdKey(candidate)})\n`,
+      );
+      return send(200, {
+        ok: true,
+        key_present: true,
+        key_valid: check.status,
+        source: "config",
+        mode: "nvd-keyed",
+        key_masked: maskNvdKey(candidate),
+        last_validation: nvdKeyValidation,
+      });
     }
     const state = resolveNvdKey(config);
     return send(200, {
       key_present: state.key !== null,
+      // v0.6.6: presence and validity are different facts. A saved key that NVD refuses is present
+      // but not valid, and only `valid` may show as green.
+      key_valid: nvdKeyHealth(http.cacheDir).status,
       source: state.source,
       mode: state.key !== null ? "nvd-keyed" : "keyless-osv+cached",
       // The browser never sees the whole key, only enough of it to keep the field readable.
@@ -307,8 +348,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
 // the browser gets the evidence package rather than a sampling request.
 const webCtx: ToolContext = { config, store, http, clientSampling: () => false, sample: async () => null, activity };
 
-/** The outcome of the background key probe started at launch, for the dashboard badge. */
-let nvdKeyValidation: { valid: boolean; error?: string; at: string } | null = null;
+/** The outcome of the last key probe (launch, key save), for the dashboard badge. */
+let nvdKeyValidation: { status: NvdKeyStatus; error?: string; at: string } | null = null;
 
 /**
  * The server-side NVD idle drain (v0.6.5, task 3): the keyed queue keeps working between
@@ -415,11 +456,18 @@ async function main(): Promise<void> {
     );
   } else {
     process.stderr.write(`  NVD API key     set (from ${keyState.source === "env" ? "NVD_API_KEY" : keyState.source === "file" ? "nvd_api_key file" : "config"}) — mode nvd-keyed\n`);
-    // A stored key is re-validated in the background, so a key that stopped working (typo, NVD
-    // revocation) prints the same honest line again instead of silently querying into 401s.
+    // Exactly one probe request at startup (v0.6.6 task 2): a key that stopped working (typo,
+    // expiry, NVD revocation) must not let the server claim a green keyed mode while every
+    // product lookup 404s away. `rejected` pauses the drain; `unknown` (network error, 429)
+    // leaves the key usable and the next probe or key change decides again.
     void validateNvdKey(keyState.key, config.settings.httpTimeoutMs).then((check) => {
       nvdKeyValidation = { ...check, at: new Date().toISOString() };
-      if (!check.valid) process.stderr.write("  no valid NVD API key — check dashboard\n");
+      recordKeyProbe(http.cacheDir, check, config.settings.nvdBreakerPauseMs ?? 900_000);
+      if (check.status === "rejected") {
+        process.stderr.write(`  NVD API key REJECTED — ${check.error ?? "NVD refused it"}; lookups fall back to keyless\n`);
+      } else if (check.status === "unknown") {
+        process.stderr.write(`  NVD API key unproven — ${check.error ?? "probe unanswered"}\n`);
+      }
     });
   }
   process.stderr.write("\n");

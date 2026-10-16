@@ -61,8 +61,18 @@ export function looksLikeNvdKey(candidate: string): boolean {
   return /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i.test(candidate.trim());
 }
 
+/**
+ * What the server currently knows about a configured key.
+ *
+ * `unknown` is a real state and not a failure: a network error, a timeout or a 429 answer says
+ * nothing about the key, and claiming otherwise would send the GUI to red on a bad WLAN. The
+ * probe runs again on the next key change and the drain keeps working, so `unknown` resolves by
+ * itself.
+ */
+export type NvdKeyStatus = "valid" | "rejected" | "unknown";
+
 export interface KeyValidation {
-  valid: boolean;
+  status: NvdKeyStatus;
   error?: string;
 }
 
@@ -70,31 +80,46 @@ export interface KeyValidation {
  * Live test of a key against NVD itself, bypassing the disk cache: it must cost no cached answer
  * and answer even when a probe ran a second ago.
  *
- * NVD answers an unknown or malformed key with HTTP 401, which is the only trustworthy check — a
- * purely local format test would accept a typo'd key and then every product query would fail.
+ * The key travels in the HTTP header `apiKey`, which is what the NVD developer documentation
+ * specifies for API 2.0. Verified with curl against the live endpoint on 2026-10-16:
+ * - `…?resultsPerPage=1` without a key → `HTTP 200` (endpoint reachable);
+ * - `…&apiKey=<key>` as a QUERY PARAMETER → `HTTP 404`, empty body, header
+ *   `message: Invalid parameter: apiKey.` — API 2.0 does not know that parameter;
+ * - header `apiKey: <key>` → accepted, and a value NVD does not accept answers with header
+ *   `message: Invalid apiKey.`.
+ * The reason of a rejection therefore lives in the `message` RESPONSE header, never in the body,
+ * which is empty. An earlier build sent the key as a query parameter and read every 404 as
+ * "freshly issued key, probably fine", which is why a keyed cold start looked healthy while its
+ * whole cache stayed empty.
  */
 export async function validateNvdKey(key: string, timeoutMs = 15_000): Promise<KeyValidation> {
   const trimmed = key.trim();
-  if (trimmed === "") return { valid: false, error: "no key given" };
+  if (trimmed === "") return { status: "rejected", error: "no key given" };
   if (!looksLikeNvdKey(trimmed)) {
-    return { valid: false, error: "not a valid NVD key format (32 hex chars or a UUID)" };
+    return { status: "rejected", error: "not a valid NVD key format (32 hex chars or a UUID)" };
   }
   try {
-    const res = await fetch(`${NVD_API}?keywordSearch=winsecure-mcp-key-probe&resultsPerPage=1&apiKey=${encodeURIComponent(trimmed)}`, {
-      headers: { accept: "application/json" },
+    const res = await fetch(`${NVD_API}?keywordSearch=winsecure-mcp-key-probe&resultsPerPage=1`, {
+      // Header, not query parameter: see the note above.
+      headers: { accept: "application/json", apiKey: trimmed },
       signal: AbortSignal.timeout(timeoutMs),
     });
-    if (res.ok) return { valid: true };
-    const detail = await res.text().catch(() => "");
-    if (res.status === 401) return { valid: false, error: "NVD rejected the key (HTTP 401)" };
-    // NVD currently answers a freshly issued key with 404 + "Invalid parameter: apiKey." while the
-    // activation has not propagated; like a 5xx this says nothing about the key, so it must not
-    // be reported as wrong, and the key stays usable.
-    if (res.status === 404) return { valid: true };
-    // A 5xx or a rate-limit answer says nothing about the key, so it must not be reported as wrong.
-    return { valid: false, error: `NVD answered HTTP ${String(res.status)}${detail ? `: ${detail.slice(0, 80)}` : ""}` };
+    if (res.ok) return { status: "valid" };
+    const message = res.headers.get("message") ?? "";
+    if (res.status === 401) return { status: "rejected", error: "NVD rejected the key (HTTP 401)" };
+    if (res.status === 404) {
+      // The two documented key rejections come through the `message` header with an empty body.
+      if (/invalid api ?key/i.test(message)) {
+        return { status: "rejected", error: `NVD rejected the key (HTTP 404${message ? `: ${message.slice(0, 80)}` : ""})` };
+      }
+      // A 404 that says nothing about the key cannot distinguish a not-yet-propagated activation
+      // from a broken request, so it must not be called valid and must not be called wrong either.
+      return { status: "unknown", error: `NVD answered HTTP 404${message ? `: ${message.slice(0, 80)}` : ""}` };
+    }
+    // A 429 or a 5xx says nothing about the key, so it is not reported as wrong, only unproven.
+    return { status: "unknown", error: `NVD answered HTTP ${String(res.status)}${message ? `: ${message.slice(0, 80)}` : ""}` };
   } catch (cause) {
-    return { valid: false, error: cause instanceof Error ? cause.message : String(cause) };
+    return { status: "unknown", error: cause instanceof Error ? cause.message : String(cause) };
   }
 }
 
@@ -126,7 +151,7 @@ interface ProductCacheEntry {
    * `failed_transient` stay open, and the last attempt time decides the queue slot so a product
    * that just failed moves to the back instead of starting the next run at the front again.
    */
-  state?: "pending" | "done" | "not_found" | "failed_transient";
+  state?: "pending" | "done" | "not_found" | "failed_transient" | "failed_request_invalid";
   /** ISO timestamp of the last network attempt (success or failure). */
   last_attempt_at?: string | null;
   /** How often this product was asked NVD directly; failure counter for the log. */
@@ -170,13 +195,57 @@ export interface ProductLookupStats {
   not_found: number;
   /** True when the per-call time budget ran out and the queue drain continues in the background. */
   warm_up_running: boolean;
+  /** Products whose answer ended at key_rejected, looked up after the key (v0.6.6). */
+  key_rejected: number;
+  /** Products NVD called an invalid request (v0.6.6). A request builder problem, retried bounded. */
+  request_invalid: number;
+  /** How many product requests the lookup actually issued this call, counted against the queue. */
+  attempts_total: number;
+  /** Products whose lookup ended `done` this call (200 answers), the number that fills the cache. */
+  done: number;
+  /**
+   * The key health the lookup saw (v0.6.6). The completeness judgement reads this to tell "the
+   * warm-up is still working" from "the configuration needs a human", which no queue number can.
+   */
+  key_status: NvdKeyStatus;
+  /** True when the circuit breaker tripped: many consecutive lookups, none answered with a 200. */
+  breaker_tripped: boolean;
 }
 
 /**
  * The outcome of asking NVD about one product, used by both the `check_cves` walk and the idle
  * drain (v0.6.5) so the two share exactly one classification.
  */
-type ProductOutcome = "done" | "not_found" | "failed_429" | "failed_404" | "failed_other";
+/**
+ * The outcome of asking NVD about one product, used by both the `check_cves` walk and the idle
+ * drain so the two share exactly one classification. Since v0.6.6 the 404 shapes are split apart,
+ * because the field runs proved one flat "failed_404" hides three different situations:
+ * - `key_rejected`: NVD names the key in the `message` header (`Invalid apiKey.`); retrying keyed
+ *   is pointless until a new key arrives, so the drain pauses and later requests go out keyless;
+ * - `request_invalid`: NVD rejects a parameter (`Invalid parameter: …`) — a bug in how the request
+ *   is built, retried only a bounded number of times instead of forever;
+ * - `failed_404`: no `message`, no envelope — the Cloudflare/unknown shape, still transient.
+ */
+type ProductOutcome =
+  | "done"
+  | "not_found"
+  | "failed_429"
+  | "failed_404"
+  | "failed_other"
+  | "key_rejected"
+  | "request_invalid";
+
+/** Why NVD answered a 404, decided from the `message` header and the body (v0.6.6). */
+function classifyNvd404(message: string | undefined, bodyText: string | undefined): ProductOutcome {
+  const msg = message ?? "";
+  // Verified live on 2026-10-16: a key NVD does not accept answers `Invalid apiKey.`, a key sent
+  // the wrong way answers `Invalid parameter: apiKey.` — both name the key and mean "stop asking
+  // keyed", not "try again".
+  if (/invalid api ?key/i.test(msg)) return "key_rejected";
+  if (nvdErrorEnvelope(bodyText)) return "not_found";
+  if (/invalid parameter|invalid request|invalid/i.test(msg)) return "request_invalid";
+  return "failed_404";
+}
 
 /**
  * Parse the body of a failed NVD answer as an NVD envelope (task 2, v0.6.5).
@@ -253,7 +322,7 @@ class ProductCache {
     if (!entry) return false;
     // A transient failure is not an answer (v0.6.5): the persisted state keeps the product open
     // in the queue, so its entry must never count fresh no matter what its timestamps say.
-    if (entry.state === "failed_transient" || entry.state === "pending") return false;
+    if (entry.state === "failed_transient" || entry.state === "pending" || entry.state === "failed_request_invalid") return false;
     if (keyed && entry.source !== "nvd") return false;
     const at = entry.not_found_at ?? entry.fetched_at;
     const age = Date.now() - Date.parse(at);
@@ -266,7 +335,7 @@ class ProductCache {
   /** Entries that carry an answer; open queue items (pending/failed) do not count as cached. */
   get size(): number {
     return Object.values(this.data.products).filter(
-      (p) => p.state !== "failed_transient" && p.state !== "pending",
+      (p) => p.state !== "failed_transient" && p.state !== "pending" && p.state !== "failed_request_invalid",
     ).length;
   }
 
@@ -464,6 +533,8 @@ async function nvdProductQuery(
   retryAfterMs?: number;
   /** Body of the failed request, when there was one (a 404's envelope decides its class, v0.6.5). */
   bodyText?: string;
+  /** `message` response header of the failure: NVD names the rejection reason here, not in the body. */
+  message?: string;
 }> {
   const collected: CveRecord[] = [];
   let lastModified: string | null = null;
@@ -484,10 +555,16 @@ async function nvdProductQuery(
         params.set("lastModEndDate", new Date().toISOString().replace(/\.\d+Z$/, "Z"));
       }
     }
-    if (opts.key) params.set("apiKey", opts.key);
-
+    // The key goes in the `apiKey` HTTP HEADER, never in the query string: NVD API 2.0 answers a
+    // query-parameter key with `HTTP 404`, empty body and `message: Invalid parameter: apiKey.`,
+    // which an earlier build retried away as a transient failure forever (verified with curl on
+    // 2026-10-16; the exact probe results are documented on `validateNvdKey`).
     await opts.throttle.acquire();
-    const res = await http.get(`${NVD_API}?${params.toString()}`, 0);
+    const res = await http.get(
+      `${NVD_API}?${params.toString()}`,
+      0,
+      opts.key !== null ? { apiKey: opts.key } : undefined,
+    );
     if (!res.body) {
       error = res.error ?? "no answer";
       return {
@@ -498,6 +575,7 @@ async function nvdProductQuery(
         status: res.status,
         retryAfterMs: res.retryAfterMs,
         bodyText: res.bodyText,
+        message: res.message,
       };
     }
     let parsed: { totalResults?: number; vulnerabilities?: { cve?: NvdCveJson }[] };
@@ -584,14 +662,69 @@ interface NvdQueueItem {
   wanted: Set<string>;
 }
 
+/**
+ * What the server currently believes about the configured key, per cache directory (v0.6.6).
+ *
+ * This exists because a rejected key and a broken request shape both look like "404 forever" from
+ * the outside, and the queue alone could not tell whether to keep rotating or stop asking keyed
+ * entirely. The status is written by `validateNvdKey` results (startup, key save) and by product
+ * lookups that see the reason in NVD's `message` header.
+ */
+export interface NvdKeyHealth {
+  status: NvdKeyStatus;
+  checked_at: string | null;
+  error?: string;
+  /** Consecutive lookups answered without a single HTTP 200; the circuit breaker's counter. */
+  streak: number;
+  /** True once the breaker tripped; cleared by any 200-class answer or a new key probe. */
+  tripped: boolean;
+}
+
+const keyHealth = new Map<string, NvdKeyHealth>();
+
+/**
+ * The current key health of a cache directory; `unknown` until something proves otherwise.
+ *
+ * The object is created into the map rather than returned fresh, because the lookup updates the
+ * streak and the breaker in place as it walks the queue.
+ */
+export function nvdKeyHealth(cacheDir: string): NvdKeyHealth {
+  let h = keyHealth.get(cacheDir);
+  if (!h) {
+    h = { status: "unknown", checked_at: null, streak: 0, tripped: false };
+    keyHealth.set(cacheDir, h);
+  }
+  return h;
+}
+
+/**
+ * Remember the result of a live key probe (startup, key save, hot key change).
+ *
+ * A `rejected` answer pauses the whole queue — while the key is wrong every keyed request is
+ * wasted — and a `valid` answer clears the breaker, so a good key resumes the drain immediately.
+ */
+export function recordKeyProbe(cacheDir: string, check: KeyValidation, pauseMs = 900_000): void {
+  const h = nvdKeyHealth(cacheDir);
+  h.status = check.status;
+  h.checked_at = new Date().toISOString();
+  h.error = check.error;
+  h.streak = 0;
+  h.tripped = check.status === "valid" ? false : h.tripped;
+  keyHealth.set(cacheDir, h);
+  const q = queueFor(cacheDir, {}, false, check.status === "rejected");
+  if (check.status === "rejected") {
+    q.throttle.pauseFor(pauseMs);
+  } else if (check.status === "valid") {
+    q.throttle.resume();
+  }
+}
+
 interface NvdQueue {
   /** Normalised name -> item, in insertion order (= processing order). */
   items: Map<string, NvdQueueItem>;
   throttle: NvdThrottle;
-  /** The interval spacing the throttle was built from, so a config change rebuilds it. */
+  /** The interval the throttle currently spaces requests at (keyed or keyless window, v0.6.6). */
   throttleIntervalMs: number;
-  /** Timer of the idle drain; `null` when no drain is armed. */
-  timer: ReturnType<typeof setInterval> | null;
   /** True while a drain tick is working the queue, so ticks never overlap. */
   busy: boolean;
 }
@@ -613,28 +746,55 @@ export interface IdleDrainBinding {
 }
 
 
-function queueFor(cacheDir: string, settings: { nvdWindowMs?: number; nvdRatePerWindow?: number; nvdJitterPct?: number; nvdBackoffCapMs?: number }, offline: boolean): NvdQueue {
-  const interval = Math.max(100, Math.round((settings.nvdWindowMs ?? 30_000) / Math.max(1, settings.nvdRatePerWindow ?? 50)));
+/**
+ * The queue of one pacing mode (v0.6.6): keyed and keyless get SEPARATE throttle instances.
+ *
+ * A rejected key switches the pacing to the keyless window, and a single queue object would then
+ * rebuild its throttle mid-flight — losing exactly the long pause the rejection set. Two queues
+ * addressed by the interval keep each mode's pause intact across the switch, and both share the
+ * one persisted product state in `products.json`, so no work is duplicated.
+ */
+/**
+ * The one NVD queue of a cache directory.
+ *
+ * Since v0.6.6 the pacing follows the key state: while NVD rejected the key the requests go out
+ * unauthenticated, so the spacing moves to the documented keyless window (5 per 30 s by
+ * default). The switch happens IN PLACE (`setIntervalMs`), because rebuilding the throttle would
+ * drop the long pause a rejection or the circuit breaker just set — the pause is the one thing
+ * a retry storm must not lose.
+ */
+function queueFor(cacheDir: string, settings: { nvdWindowMs?: number; nvdRatePerWindow?: number; nvdKeylessRatePerWindow?: number; nvdJitterPct?: number; nvdBackoffCapMs?: number }, offline: boolean, keyRejected = false): NvdQueue {
+  const rate = keyRejected ? Math.max(1, settings.nvdKeylessRatePerWindow ?? 5) : Math.max(1, settings.nvdRatePerWindow ?? 50);
+  const interval = Math.max(100, Math.round((settings.nvdWindowMs ?? 30_000) / rate));
   let q = nvdQueues.get(cacheDir);
-  if (q && q.throttleIntervalMs !== interval) q = undefined;
   if (!q) {
     const jitterPct = Math.min(100, Math.max(0, settings.nvdJitterPct ?? 20));
     q = {
       items: new Map(),
       throttle: new NvdThrottle(interval, offline, Math.round((interval * jitterPct) / 100), settings.nvdBackoffCapMs ?? 60_000),
       throttleIntervalMs: interval,
-      timer: null,
       busy: false,
     };
     nvdQueues.set(cacheDir, q);
+  } else if (q.throttleIntervalMs !== interval) {
+    q.throttle.setIntervalMs(interval);
+    q.throttleIntervalMs = interval;
   }
   return q;
 }
 
+/**
+ * The idle-drain timer per cache directory (v0.6.6).
+ *
+ * It lives apart from the queue object so a key rejection switching the pacing cannot strand the
+ * timer on a queue that no longer gets worked.
+ */
+const drainTimers = new Map<string, ReturnType<typeof setInterval>>();
+
 /** Whether the idle drain is armed or currently working this cache directory. */
 export function drainActive(cacheDir: string): boolean {
   const q = nvdQueues.get(cacheDir);
-  return q !== undefined && (q.timer !== null || q.busy);
+  return drainTimers.has(cacheDir) || (q !== undefined && q.busy);
 }
 
 /**
@@ -649,9 +809,16 @@ async function askNvdProduct(
   item: NvdQueueItem,
   opts: {
     key: string | null;
-    settings: { nvdMaxPages: number };
+    settings: {
+      nvdMaxPages: number;
+      nvdBreakerThreshold?: number;
+      nvdBreakerPauseMs?: number;
+      nvdRequestInvalidMaxAttempts?: number;
+    };
     throttle: NvdThrottle;
     force: boolean;
+    /** The cache directory the key health and the circuit breaker are tracked against. */
+    cacheDir: string;
   },
   onStatus?: (product: string, status: number) => void,
   /** Receives the concrete failure reason of every failed product (the aggregate `source_errors` line). */
@@ -659,10 +826,14 @@ async function askNvdProduct(
 ): Promise<ProductOutcome> {
   const prev = cache.get(item.name);
   const since = opts.force ? null : (prev?.not_found_at ? null : (prev?.last_modified ?? null));
+  const health = nvdKeyHealth(opts.cacheDir);
+  // A key NVD rejected (task 4, v0.6.6): ask keyless so the run keeps making progress at the
+  // keyless pacing instead of burning the window on a header the endpoint refuses.
+  const effectiveKey = health.status === "rejected" ? null : opts.key;
   const res = await nvdProductQuery(http, {
     name: item.name,
     wanted: item.wanted,
-    key: opts.key,
+    key: effectiveKey,
     sinceModified: since,
     maxPages: Math.max(1, Math.round(opts.settings.nvdMaxPages)),
     throttle: opts.throttle,
@@ -670,6 +841,17 @@ async function askNvdProduct(
   const status = res.status ?? 0;
   const attemptAt = new Date().toISOString();
   const attempts = (prev?.attempts ?? 0) + 1;
+  /** Records a failure and bumps the breaker streak; trips it after N failures without any 200. */
+  const bumpBreaker = (): void => {
+    health.streak += 1;
+    const threshold = Math.max(1, Math.round(opts.settings.nvdBreakerThreshold ?? 20));
+    if (!health.tripped && health.streak >= threshold) {
+      health.tripped = true;
+      // A long pause, not a retry storm: whatever is wrong (key, request shape, an NVD oddity)
+      // is not fixed by asking again a second later.
+      opts.throttle.pauseFor(Math.max(1_000, Math.round(opts.settings.nvdBreakerPauseMs ?? 900_000)));
+    }
+  };
   const markFailed = (): void => {
     cache.set(item.name, {
       name: item.name,
@@ -689,16 +871,63 @@ async function askNvdProduct(
     // The whole queue pauses on this answer; the product stays open and is asked again later.
     opts.throttle.rateLimited(res.retryAfterMs);
     markFailed();
+    bumpBreaker();
     onStatus?.(item.name, 429);
     onFail?.(res.error ?? "HTTP 429");
     return "failed_429";
   }
+  if (status === 401) {
+    // NVD's documented answer to an unknown key. Same treatment as the 404 rejection: the key is
+    // the problem, not the product, so the drain stops asking keyed until a probe says otherwise.
+    health.status = "rejected";
+    health.error = "NVD rejected the key (HTTP 401)";
+    keyHealth.set(opts.cacheDir, health);
+    opts.throttle.pauseFor(Math.max(1_000, Math.round(opts.settings.nvdBreakerPauseMs ?? 900_000)));
+    markFailed();
+    bumpBreaker();
+    onStatus?.(item.name, 401);
+    onFail?.(`HTTP 401: ${health.error}`);
+    return "key_rejected";
+  }
   if (status === 404) {
-    const envelope = nvdErrorEnvelope(res.bodyText);
-    if (envelope) {
-      // A 404 that IS an NVD envelope is the answer "this product matches zero CVEs": a real
-      // negative with the not-found TTL, counted separately from failures, and explicitly not
-      // "enriched" — the product has no CVE records, it has a statement that it has none.
+    const cls = classifyNvd404(res.message, res.bodyText);
+    if (cls === "key_rejected") {
+      // The `message` header names the key ("Invalid apiKey."): remember it so the rest of this
+      // batch and later drain ticks go out keyless at the keyless pacing, and pause the queue so
+      // the remaining keyed requests of a 400-product walk do not each eat one wasted 404.
+      health.status = "rejected";
+      health.error = `NVD rejected the key (HTTP 404: ${(res.message ?? "").slice(0, 80)})`;
+      keyHealth.set(opts.cacheDir, health);
+      opts.throttle.pauseFor(Math.max(1_000, Math.round(opts.settings.nvdBreakerPauseMs ?? 900_000)));
+      markFailed();
+      bumpBreaker();
+      onStatus?.(item.name, 404);
+      onFail?.(health.error);
+      return "key_rejected";
+    }
+    if (cls === "request_invalid") {
+      // NVD rejects a parameter this server builds: a request-construction bug, and retrying the
+      // same broken request forever is what hid the empty cache for seven runs. Log it per
+      // product with the header text, retry only up to the configured bound, then close it out.
+      cache.set(item.name, {
+        name: item.name,
+        records: prev?.records ?? [],
+        last_modified: prev?.last_modified ?? null,
+        fetched_at: prev?.fetched_at ?? attemptAt,
+        source: prev?.source ?? "nvd",
+        truncated: prev?.truncated ?? false,
+        not_found_at: null,
+        state: "failed_request_invalid",
+        last_attempt_at: attemptAt,
+        attempts,
+      });
+      onStatus?.(item.name, 404);
+      onFail?.(`HTTP 404: ${(res.message ?? "invalid request").slice(0, 80)}`);
+      return "request_invalid";
+    }
+    if (cls === "not_found") {
+      // A 404 whose body IS an NVD envelope is the answer "this product matches zero CVEs": a
+      // real negative with the not-found TTL, counted separately from failures.
       cache.set(item.name, {
         name: item.name,
         records: [],
@@ -714,18 +943,22 @@ async function askNvdProduct(
       onStatus?.(item.name, 404);
       return "not_found";
     }
-    // Empty or foreign body: the key-flakiness / Cloudflare shape. Transient, retried later.
+    // No message, no envelope: the Cloudflare/unknown shape. Transient, retried later.
     markFailed();
+    bumpBreaker();
     onStatus?.(item.name, 404);
     onFail?.(res.error ?? "HTTP 404");
     return "failed_404";
   }
   if (res.error && res.records.length === 0) {
     markFailed();
+    bumpBreaker();
     onFail?.(res.error);
     return "failed_other";
   }
   opts.throttle.succeeded();
+  health.streak = 0;
+  health.tripped = false;
   // Incremental answers only add and update; a full one (no `since`) also drops CVEs the
   // product stopped being mentioned in. A full answer with zero results is a negative marker
   // with the not-found TTL, not a day-fresh "done".
@@ -766,6 +999,9 @@ async function drainBatch(cacheDir: string, batch: number): Promise<void> {
   try {
     const cache = new ProductCache(cacheDir);
     const settings = binding.config.settings;
+    // Re-check the pacing every tick: a key rejected since the last tick moves the SAME queue to
+    // the keyless window, and a key fixed again moves it back, without losing the pause.
+    queueFor(cacheDir, settings, process.env.WSMD_OFFLINE === "1", keyHealth.get(cacheDir)?.status === "rejected");
     let done = 0;
     while (done < batch && q.items.size > 0) {
       const head = q.items.entries().next();
@@ -778,9 +1014,14 @@ async function drainBatch(cacheDir: string, batch: number): Promise<void> {
         settings,
         throttle: q.throttle,
         force: false,
+        cacheDir,
       }, binding.onStatus);
-      if (outcome === "failed_429" || outcome === "failed_404" || outcome === "failed_other") {
-        q.items.set(key, item); // round-robin: the failure waits at the back again
+      const attempts = cache.get(item.name)?.attempts ?? 0;
+      const maxInvalid = Math.max(1, Math.round(settings.nvdRequestInvalidMaxAttempts ?? 3));
+      // Round-robin every open outcome to the back; a `request_invalid` product closes out after
+      // its bounded retries so a broken request shape cannot rotate through the queue forever.
+      if (outcome !== "done" && outcome !== "not_found" && !(outcome === "request_invalid" && attempts >= maxInvalid)) {
+        q.items.set(key, item);
       }
     }
     cache.save();
@@ -792,14 +1033,14 @@ async function drainBatch(cacheDir: string, batch: number): Promise<void> {
 
 
 function armIdleTimer(cacheDir: string, periodMs: number): void {
-  const q = nvdQueues.get(cacheDir);
-  if (!q || q.timer !== null) return;
-  q.timer = setInterval(
+  if (drainTimers.has(cacheDir)) return;
+  const timer = setInterval(
     () => void drainBatch(cacheDir, drainBindings.get(cacheDir)?.config.settings.nvdIdleDrainBatch ?? 5),
     Math.max(5_000, periodMs),
   );
   // The MCP stdio transport keeps the process alive; the drain must not hold it open on its own.
-  q.timer.unref?.();
+  timer.unref?.();
+  drainTimers.set(cacheDir, timer);
 }
 
 /**
@@ -815,12 +1056,31 @@ export function startIdleDrain(binding: IdleDrainBinding): void {
   armIdleTimer(binding.cacheDir, binding.config.settings.nvdIdleDrainMs ?? 30_000);
 }
 
+/**
+ * Test-only window into the module-level queue state (v0.6.6).
+ *
+ * The queue map is addressed by `cacheDir|interval`, which no production caller cares about; the
+ * tests need it to assert the pacing a key rejection switched to, and to start from clean maps.
+ */
+export const __testing = {
+  queues(cacheDir: string): NvdQueue[] {
+    const q = nvdQueues.get(cacheDir);
+    return q === undefined ? [] : [q];
+  },
+  reset(cacheDir: string): void {
+    nvdQueues.delete(cacheDir);
+    stopIdleDrain(cacheDir);
+    drainBindings.delete(cacheDir);
+    keyHealth.delete(cacheDir);
+  },
+};
+
 /** Stop the idle drain (shutdown, key removal, or an empty queue). */
 export function stopIdleDrain(cacheDir: string): void {
-  const q = nvdQueues.get(cacheDir);
-  if (q?.timer) {
-    clearInterval(q.timer);
-    q.timer = null;
+  const timer = drainTimers.get(cacheDir);
+  if (timer) {
+    clearInterval(timer);
+    drainTimers.delete(cacheDir);
   }
 }
 
@@ -888,6 +1148,10 @@ export async function lookupProducts(options: {
   let failed404 = 0;
   let failedOther = 0;
   let notFound = 0;
+  let keyRejected = 0;
+  let requestInvalid = 0;
+  let attemptsTotal = 0;
+  let doneCount = 0;
 
   // Defensive defaults, so a config written before v0.6.3 (or a minimal test config) still paces.
   const notFoundTtlMs = (settings.nvdNotFoundTtlHours ?? 168) * 60 * 60 * 1000;
@@ -906,11 +1170,23 @@ export async function lookupProducts(options: {
     // the front, and — the point of the whole change — NOT rebuilt from the inventory order every
     // call. A product that just failed sits at the back, so seven runs in a row no longer start
     // at the same four names while 400 products never come to word.
-    const q = queueFor(cacheDir, settings, offline);
+    // A key NVD rejected paces the drain to the keyless window (task 4): the requests that go out
+    // anyway are unauthenticated in effect, and the documented keyless limit is what they must
+    // respect. `queueFor` rebuilds the throttle when this flips, so a new key returns to keyed
+    // pacing without a restart.
+    const q = queueFor(cacheDir, settings, offline, keyHealth.get(cacheDir)?.status === "rejected");
+    // A product whose invalid-request retries are used up stays OUT of the queue (v0.6.6):
+    // without this bound every call would re-add it and rotate a broken request shape forever.
+    const maxInvalidSync = Math.max(1, Math.round(settings.nvdRequestInvalidMaxAttempts ?? 3));
     for (const item of names) {
       const key = normName(item.name);
+      const held = cache.get(item.name);
       if (cache.isFresh(item.name, options.ttlMs, true, notFoundTtlMs, options.force)) {
         q.items.delete(key);
+      } else if (
+        held?.state === "failed_request_invalid" && (held.attempts ?? 0) >= maxInvalidSync && !options.force
+      ) {
+        // closed out: logged, bounded, not retried until a force or a config change
       } else if (!q.items.has(key)) {
         q.items.set(key, { name: item.name, wanted: item.wanted });
       }
@@ -935,11 +1211,13 @@ export async function lookupProducts(options: {
     const work = [...due];
 
     const runOne = async (item: NvdQueueItem): Promise<void> => {
+      attemptsTotal += 1;
       const outcome = await askNvdProduct(http, cache, item, {
         key: keyState.key,
         settings,
         throttle: q.throttle,
         force: options.force,
+        cacheDir,
       }, options.onStatus, noteError);
       switch (outcome) {
         case "failed_429":
@@ -951,11 +1229,18 @@ export async function lookupProducts(options: {
         case "failed_other":
           failedOther += 1;
           break;
+        case "key_rejected":
+          keyRejected += 1;
+          break;
+        case "request_invalid":
+          requestInvalid += 1;
+          break;
         case "not_found":
           notFound += 1;
           refreshed += 1;
           break;
         case "done":
+          doneCount += 1;
           refreshed += 1;
           break;
       }
@@ -966,6 +1251,10 @@ export async function lookupProducts(options: {
     // before a client timeout while the warm-up keeps going outside the call (task 3).
     const worker = async (): Promise<void> => {
       while (work.length > 0 && (offline || Date.now() - startedAt < budgetMs)) {
+        // A queue pause (key rejection, breaker, 429 backoff) longer than what is left of the
+        // call's budget must end the call, not stall inside `acquire()`: the answer stays timely
+        // and the idle drain picks the rest up when the pause lifts.
+        if (!offline && q.throttle.pausedUntilMs() - Date.now() > budgetMs - (Date.now() - startedAt)) break;
         const next = work.shift();
         if (next) await runOne(next.item);
       }
@@ -975,9 +1264,14 @@ export async function lookupProducts(options: {
     // Closed outcomes stay out of the queue; open ones (failures included, and the items the
     // time budget never reached) go to the back, so both the idle drain and the next call
     // continue where this one stopped rather than starting over at the same names.
+    // A `request_invalid` product only leaves the queue once its bounded retries are used up; the
+    // drain applies the same rule, so the two paths agree on when a product is closed out.
+    const maxInvalid = Math.max(1, Math.round(settings.nvdRequestInvalidMaxAttempts ?? 3));
     for (const { key, item } of due) {
       const entry = cache.get(item.name);
-      if (entry?.state !== "done" && entry?.state !== "not_found") q.items.set(key, item);
+      if (entry?.state === "done" || entry?.state === "not_found") continue;
+      if (entry?.state === "failed_request_invalid" && (entry.attempts ?? 0) >= maxInvalid) continue;
+      q.items.set(key, item);
     }
     deferred = q.items.size;
 
@@ -1067,6 +1361,12 @@ export async function lookupProducts(options: {
       failed_other: failedOther,
       not_found: notFound,
       warm_up_running: drainActive(cacheDir),
+      key_rejected: keyRejected,
+      request_invalid: requestInvalid,
+      attempts_total: attemptsTotal,
+      done: doneCount,
+      key_status: keyHealth.get(cacheDir)?.status ?? "unknown",
+      breaker_tripped: keyHealth.get(cacheDir)?.tripped ?? false,
     },
   };
 }

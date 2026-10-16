@@ -61,6 +61,12 @@ export interface Settings {
    * because the live beta showed a parallel salvo eating HTTP 429 on almost every product.
    */
   nvdRatePerWindow: number;
+  /**
+   * Requests per window when the key is absent or NVD rejected it (v0.6.6). NVD's documented
+   * keyless limit is 5 per 30 s, and a rejected key means the request goes out unauthenticated in
+   * practice, so the drain paces itself to this slower window instead of the keyed one.
+   */
+  nvdKeylessRatePerWindow: number;
   /** The window `nvdRatePerWindow` counts against, in milliseconds. */
   nvdWindowMs: number;
   /** Requests issued at the same time against NVD. One is the safe default; the queue honors a pause as a whole. */
@@ -94,6 +100,23 @@ export interface Settings {
    * not a failure, and the new state tracking keeps it apart from transient errors.
    */
   nvdNotFoundTtlHours: number;
+  /**
+   * How many consecutive product lookups without a single HTTP 200 trip the circuit breaker
+   * (v0.6.6). A field run answered nearly every lookup with a 404 whose reason only the `message`
+   * header carried; rotating the queue forever looked like progress while the cache stayed empty.
+   */
+  nvdBreakerThreshold: number;
+  /**
+   * How long the drain rests when the circuit breaker trips, in milliseconds (v0.6.6). Long on
+   * purpose: a breaker only makes sense if it stops the retry storm it exists to stop.
+   */
+  nvdBreakerPauseMs: number;
+  /**
+   * How often one product may be retried when NVD calls the request itself invalid (a request
+   * builder bug, not a transient wall, v0.6.6). After that the product leaves the queue instead
+   * of rotating through it endlessly.
+   */
+  nvdRequestInvalidMaxAttempts: number;
   /** Root paths never walked by the portable-app scan. */
   portableExcludes: string[];
   /** Maximum portable `.exe` hits kept before the result is cut (the paths are still reported). */
@@ -162,6 +185,7 @@ export function loadConfig(): ConfigStore {
     nvdProductsPerRun: 400,
     nvdMaxPages: 5,
     nvdRatePerWindow: 50,
+    nvdKeylessRatePerWindow: 5,
     nvdWindowMs: 30_000,
     nvdConcurrency: 1,
     nvdJitterPct: 20,
@@ -170,6 +194,9 @@ export function loadConfig(): ConfigStore {
     nvdIdleDrainBatch: 5,
     nvdCallBudgetMs: 20_000,
     nvdNotFoundTtlHours: 168,
+    nvdBreakerThreshold: 20,
+    nvdBreakerPauseMs: 900_000,
+    nvdRequestInvalidMaxAttempts: 3,
     portableExcludes: [...DEFAULT_EXCLUDES],
     portableMaxResults: 40,
     portableTimeoutMs: 60_000,
@@ -193,6 +220,7 @@ export function loadConfig(): ConfigStore {
     settings.nvdProductsPerRun = num(file.nvdProductsPerRun, settings.nvdProductsPerRun);
     settings.nvdMaxPages = num(file.nvdMaxPages, settings.nvdMaxPages);
     settings.nvdRatePerWindow = num(file.nvdRatePerWindow, settings.nvdRatePerWindow);
+    settings.nvdKeylessRatePerWindow = num(file.nvdKeylessRatePerWindow, settings.nvdKeylessRatePerWindow);
     settings.nvdWindowMs = num(file.nvdWindowMs, settings.nvdWindowMs);
     settings.nvdConcurrency = num(file.nvdConcurrency, settings.nvdConcurrency);
     settings.nvdJitterPct = num(file.nvdJitterPct, settings.nvdJitterPct);
@@ -201,6 +229,9 @@ export function loadConfig(): ConfigStore {
     settings.nvdIdleDrainBatch = num(file.nvdIdleDrainBatch, settings.nvdIdleDrainBatch);
     settings.nvdCallBudgetMs = num(file.nvdCallBudgetMs, settings.nvdCallBudgetMs);
     settings.nvdNotFoundTtlHours = num(file.nvdNotFoundTtlHours, settings.nvdNotFoundTtlHours);
+    settings.nvdBreakerThreshold = num(file.nvdBreakerThreshold, settings.nvdBreakerThreshold);
+    settings.nvdBreakerPauseMs = num(file.nvdBreakerPauseMs, settings.nvdBreakerPauseMs);
+    settings.nvdRequestInvalidMaxAttempts = num(file.nvdRequestInvalidMaxAttempts, settings.nvdRequestInvalidMaxAttempts);
     if (Array.isArray(file.portableExcludes)) settings.portableExcludes = file.portableExcludes.map(String);
     settings.portableMaxResults = num(file.portableMaxResults, settings.portableMaxResults);
     settings.portableTimeoutMs = num(file.portableTimeoutMs, settings.portableTimeoutMs);

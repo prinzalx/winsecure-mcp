@@ -297,6 +297,17 @@ export const cveTools: ToolDefinition[] = [
           ttlMs: ttl(settings.cvelistTtlHours),
           force: args.refresh === true,
           priority,
+          // Per-product 429/404 into the activity log while the call still runs (task 5): a total
+          // count alone left operators guessing which product NVD refused.
+          onStatus: (product, status) =>
+            ctx.activity?.add({
+              at: new Date().toISOString(),
+              tool: "check_cves",
+              ok: false,
+              duration_ms: 0,
+              origin: "nvd",
+              summary: `${product}: HTTP ${String(status)}${status === 429 ? " (rate limited, queue paused)" : ""}`,
+            }),
         }),
         // Since v0.6.3 the cvelist delta index loads in every mode (task 3): the keyed cold start
         // that skipped it lost the hits its own NVD keyword queries missed, and the v0.6.2 keyless

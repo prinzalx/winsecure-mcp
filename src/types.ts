@@ -4,6 +4,7 @@ import type { z } from "zod";
 import type { ConfigStore } from "./config.js";
 import type { DataStore } from "./store.js";
 import type { Http } from "./utils/net.js";
+import type { Activity } from "./dashboard.js";
 
 export type ModuleName = "inventory" | "cves" | "todos";
 
@@ -21,6 +22,12 @@ export interface ToolContext {
   http: Http;
   clientSampling(): boolean;
   sample(prompt: string): Promise<{ text: string } | null>;
+  /**
+   * The server's in-memory activity ring, when the caller owns one. Since v0.6.3 a long-running
+   * lookup notes per-product failures (HTTP 429/404 with the product name) into it while the call
+   * still runs, which the one-line-per-call summary alone could not carry.
+   */
+  activity?: Activity;
 }
 
 export interface ToolDefinition {

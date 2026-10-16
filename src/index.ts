@@ -101,6 +101,7 @@ function buildMcpServer(origin: string): { server: McpServer; ctx: ToolContext }
         return null;
       }
     },
+    activity,
   };
 
   for (const tool of ALL_TOOLS) {
@@ -298,7 +299,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
 
 // The dashboard endpoints answer from a context without a session, so an assessment triggered in
 // the browser gets the evidence package rather than a sampling request.
-const webCtx: ToolContext = { config, store, http, clientSampling: () => false, sample: async () => null };
+const webCtx: ToolContext = { config, store, http, clientSampling: () => false, sample: async () => null, activity };
 
 /** The outcome of the background key probe started at launch, for the dashboard badge. */
 let nvdKeyValidation: { valid: boolean; error?: string; at: string } | null = null;

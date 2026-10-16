@@ -2,6 +2,54 @@
 
 All notable changes to winsecure-mcp are documented here.
 
+## 0.6.6 — 2026-10-16
+
+Fixes why keyed NVD lookups answered almost only HTTP 404 with an empty body, leaving
+`products_cached` at 0 while `deferred` stayed at 427 of 428 and the hit count stayed 1.
+
+**Diagnosis (curl against the live endpoint, 2026-10-16).** The 404s were the key being rejected,
+not the products missing: `cves/2.0?resultsPerPage=1` without a key answered `200`, the same
+request with the key as a **query parameter** (what this server sent) answered `404` with an empty
+body and the response header `message: Invalid parameter: apiKey.`, and the key as an HTTP
+**header** answered `404` with `message: Invalid apiKey.` when the value itself is not accepted.
+NVD API 2.0 documents the header, and the `message` header is the only thing that names the reason
+— the body is empty. An earlier build had read every such 404 as "freshly issued key, probably
+fine", so a keyed cold start looked healthy while its whole cache stayed empty, and the flat
+"404 without envelope = transient" class then rotated the queue forever without any product ever
+reaching `done` or `not_found`.
+
+- **The key now travels in the `apiKey` HTTP header** in every product query and in the validation
+  probe (`Http.get` gained an optional headers argument, and a failed answer carries the
+  `message` response header). No existing caller or schema changed.
+- **Key validation is a real state, not a boolean.** A single probe runs at startup and on every
+  key change (hot key change included) and yields `valid` / `rejected` / `unknown`; a 429 or a
+  network error is `unknown` and re-checked later, never reported as a wrong key. The dashboard
+  badge is green only on `valid`, yellow on present-but-unproven, red on `rejected` (the green
+  icon used to mean "key present" while every lookup 404ed), and `/api/state` plus `/api/nvd_key`
+  report `key_present` and `key_valid` apart. A rejected key still saves — refusing it outright
+  was what left hosts with no progress at all. A product lookup that sees the rejection reasons
+  (`Invalid apiKey.` / `401`) sets the same state without waiting for a probe.
+- **A 404 is classified by the `message` header and the body**: key rejected (drain pauses, no
+  retry storm), invalid parameter (`request_invalid`, logged per product with the header text and
+  retried only `nvdRequestInvalidMaxAttempts` times, then closed out — a request-building bug must
+  not rotate forever), real zero match (`not_found` with TTL, unchanged from v0.6.5), and 429/5xx
+  still transient with backoff. `not_found` and the failure classes are counted apart.
+- **A circuit breaker** pauses the drain for `nvdBreakerPauseMs` after `nvdBreakerThreshold`
+  consecutive lookups without a single `200`, instead of working the queue at full speed past the
+  same wall. A `200` or a valid probe closes it again.
+- **A rejected key falls back to keyless requests** paced at the documented keyless limit
+  (`nvdKeylessRatePerWindow`, 5 per 30 s), so a wrong key costs enrichment, not all progress. The
+  same queue switches pacing in place, keeping the pause it was given; a new or revalidated key
+  returns to keyed without a restart.
+- **`completeness` gained additive fields**: `reasons` can carry the machine-readable tokens
+  `nvd_key_rejected`, `nvd_requests_invalid` and `nvd_all_lookups_failing`; `lookups` gained
+  `done`, `failed_transient`, `failed_request_invalid` and `attempts_total`; `hint` names the
+  action ("NVD API key rejected — check the key in the config") and `needs_attention: true`
+  appears when waiting will not help. `cve_status` values are untouched.
+- README: the cold-start section documents the four 404 shapes, the header rule, the breaker and
+  the key badge; `skills/windows-cve-triage` tells an agent to act on `needs_attention` instead of
+  re-checking a rejected key forever.
+
 ## 0.6.5 — 2026-10-16
 
 Fixes the keyed NVD cold start of the second live beta (7 runs over ~2 h, key active, 357 programs):

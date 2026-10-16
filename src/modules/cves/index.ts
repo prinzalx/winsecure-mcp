@@ -197,19 +197,35 @@ export function buildCompleteness(
     failed_404: number;
     failed_other: number;
     not_found: number;
+    /** Products answered with a 200 this call (v0.6.6, additive). */
+    done: number;
+    /** Transient failures of this call (429 + 404-without-envelope + other), v0.6.6 additive. */
+    failed_transient: number;
+    /** Products NVD called an invalid request (v0.6.6, additive). */
+    failed_request_invalid: number;
+    /** Requests actually issued this call (v0.6.6, additive). */
+    attempts_total: number;
   };
   hint: string;
+  /** Only present when a human has to act (rejected key, invalid requests, open breaker). */
+  needs_attention?: boolean;
 } {
   const reasons: string[] = [];
   if (cveStatus === "unknown") reasons.push("no CVE source reachable at all");
   if (stats.pending > 0) reasons.push(`${String(stats.pending)} of ${String(stats.products_total)} product lookups unanswered`);
   if (stats.deferred > 0) reasons.push(`${String(stats.deferred)} product(s) beyond the per-run budget`);
   if (stats.failed_429 > 0) reasons.push(`${String(stats.failed_429)} product(s) rate limited (HTTP 429)`);
-  if (stats.failed_404 > 0) reasons.push(`${String(stats.failed_404)} product(s) answered 404 (NVD flakes on this with a key)`);
+  if (stats.failed_404 > 0) reasons.push(`${String(stats.failed_404)} product(s) answered 404 without a reason (transient)`);
   if (stats.failed_other > 0) reasons.push(`${String(stats.failed_other)} product(s) failed transiently`);
+  // The three v0.6.6 tokens are machine-readable on purpose: an agent must be able to tell
+  // "the warm-up still needs time" from "a human has to fix the configuration".
+  if (stats.key_rejected > 0 || stats.key_status === "rejected") reasons.push("nvd_key_rejected");
+  if (stats.request_invalid > 0) reasons.push("nvd_requests_invalid");
+  if (stats.breaker_tripped) reasons.push("nvd_all_lookups_failing");
   if (warmUpRunning) reasons.push("NVD warm-up continues in the background");
 
   const incomplete = cveStatus === "unknown" || stats.pending > 0 || stats.deferred > 0 || warmUpRunning;
+  const needsAttention = stats.key_rejected > 0 || stats.key_status === "rejected" || stats.request_invalid > 0 || stats.breaker_tripped;
   return {
     status: incomplete ? "incomplete" : "complete",
     warming_up: warmUpRunning || stats.pending > 0 || stats.deferred > 0,
@@ -222,10 +238,22 @@ export function buildCompleteness(
       failed_404: stats.failed_404,
       failed_other: stats.failed_other,
       not_found: stats.not_found,
+      done: stats.done,
+      failed_transient: stats.failed_429 + stats.failed_404 + stats.failed_other + stats.key_rejected,
+      failed_request_invalid: stats.request_invalid,
+      attempts_total: stats.attempts_total,
     },
-    hint: incomplete
-      ? "Results incomplete — the NVD data was not fully reached (cold cache and/or rate limits). This is NOT \"patched\": re-run check_cves after a few minutes and compare before drawing a conclusion."
-      : "All products were answered from NVD or a fresh cache.",
+    hint: stats.key_status === "rejected" || stats.key_rejected > 0
+      ? "NVD API key rejected — check the key in the config (the dashboard shows the reason). Lookups continue keyless at the keyless rate; a low hit count is the data source, not a patched machine."
+      : stats.request_invalid > 0
+        ? "NVD rejected the request shape (HTTP 404 with an \"invalid parameter\" message) — this is a request-building problem, not a patched machine."
+        : stats.breaker_tripped
+          ? "Every recent NVD lookup failed (circuit breaker open, drain paused). This is NOT \"patched\": re-run check_cves after a few minutes."
+          : incomplete
+            ? "Results incomplete — the NVD data was not fully reached (cold cache and/or rate limits). This is NOT \"patched\": re-run check_cves after a few minutes and compare before drawing a conclusion."
+            : "All products were answered from NVD or a fresh cache.",
+    // `needs_attention` is the one-line answer to "should a human look at this?".
+    ...(needsAttention ? { needs_attention: true } : {}),
   };
 }
 
@@ -256,8 +284,13 @@ export const cveTools: ToolDefinition[] = [
       "call continues at the queue's current position, and a product that failed waits at the BACK (round-robin), so " +
       "runs no longer restart at the same names while hundreds never come to word. An idle-drain server timer keeps " +
       "working the queue between calls; deferred is the queue's open remainder and falls towards 0 across runs. " +
-      "A 404 whose body is an NVD envelope is a real zero-match answer (not_found, trusted for nvdNotFoundTtlHours, " +
-      "counted apart from failures); a 404 with an empty or foreign body is key/Cloudflare flakiness and transient. " +
+      "A 404 is classified by NVD's `message` response header and its body (v0.6.6): " +
+      "an envelope 404 is a real zero-match answer (not_found, trusted for nvdNotFoundTtlHours, counted apart from " +
+      "failures); `Invalid apiKey.` or HTTP 401 means the KEY is rejected — the queue pauses and later requests go " +
+      "out keyless at nvdKeylessRatePerWindow; `Invalid parameter:` is a rejected request shape (request_invalid, " +
+      "retried nvdRequestInvalidMaxAttempts times then closed out); an unexplained 404 is Cloudflare flakiness and " +
+      "transient. The key itself travels in the apiKey HTTP header, never in the query string, and a circuit breaker " +
+      "pauses the drain after nvdBreakerThreshold consecutive lookups without one 200. " +
       "A keyless OSV cache entry never counts fresh in keyed mode — it lacks CVSS and ranges, so keyed mode re-asks " +
       "NVD to enrich it.\n" +
       "The pre-v0.6.0 cvelist delta index is loaded in every mode since v0.6.3 and merged into the product answers " +
@@ -455,6 +488,12 @@ export const cveTools: ToolDefinition[] = [
           /** How the CVE answers were obtained: keyed NVD or the keyless OSV-plus-cache fallback. */
           mode: lookup.stats.mode,
           nvd_key: lookup.stats.mode === "nvd-keyed" ? resolveNvdKey(ctx.config).source : null,
+          /**
+           * What NVD says about that key (v0.6.6, additive): `valid`, `rejected` or `unknown`. A
+           * rejected key still runs the per-product NVD walk, but every request goes out keyless at
+           * the keyless limit, so the mode alone would overstate what the answers are worth.
+           */
+          nvd_key_status: lookup.stats.key_status,
           product_cache: {
             products_cached: lookup.stats.products_cached,
             refreshed: lookup.stats.refreshed,
@@ -486,6 +525,11 @@ export const cveTools: ToolDefinition[] = [
           todos: store.todos.length,
           source_errors: [
             kev.error,
+            // A rejected key belongs in the main payload too: the mode still reads nvd-keyed while
+            // every request actually goes out keyless, and `fewer hits` must not read as `patched`.
+            ...(lookup.stats.key_status === "rejected" || lookup.stats.key_rejected > 0
+              ? ["NVD API key rejected — lookups run keyless at the keyless rate; check the key in the config"]
+              : []),
             ...(lookup.stats.mode === "keyless-osv+cached"
               // The console hint belongs in the answer too: a keyless run must never read as a
               // claim of completeness.

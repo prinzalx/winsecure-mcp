@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { ARGS, loadConfig } from "./config.js";
 import { computeState, createActivity, type Activity } from "./dashboard.js";
+import { resolveNvdKey, validateNvdKey } from "./modules/cves/products.js";
 import { ALL_TOOLS, TOOLS_BY_NAME } from "./modules/index.js";
 import { openStore, storeExists, type DataStore } from "./store.js";
 import type { ToolContext, ToolDefinition } from "./types.js";
@@ -231,7 +232,42 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       tools: ALL_TOOLS,
       activity: activity.recent(20),
       clientSampling: attachedClientSampling,
+      nvdKey: { present: resolveNvdKey(config).key !== null, source: resolveNvdKey(config).source },
     }));
+  }
+
+  // The dashboard's NVD key section. The key itself never travels to the browser — the answer
+  // says whether one is set and where it came from, nothing more.
+  if (url.pathname === "/api/nvd_key") {
+    if (req.method === "POST") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      const raw = Buffer.concat(chunks).toString("utf8");
+      const body = (raw ? JSON.parse(raw) : {}) as { key?: unknown };
+      const candidate = String(body.key ?? "").trim();
+      if (candidate === "") {
+        config.settings.nvdApiKey = null;
+        config.save();
+        return send(200, { ok: true, key_present: false, mode: "keyless-osv+cached" });
+      }
+      const check = await validateNvdKey(candidate, config.settings.httpTimeoutMs);
+      if (!check.valid) {
+        // The console contract: a failed validation says the same line the startup hint says.
+        process.stderr.write("  no valid NVD API key — check dashboard\n");
+        return send(400, { ok: false, error: check.error ?? "invalid key" });
+      }
+      config.settings.nvdApiKey = candidate;
+      config.save();
+      return send(200, { ok: true, key_present: true, source: "config", mode: "nvd-keyed" });
+    }
+    const state = resolveNvdKey(config);
+    return send(200, {
+      key_present: state.key !== null,
+      source: state.source,
+      mode: state.key !== null ? "nvd-keyed" : "keyless-osv+cached",
+      last_validation: nvdKeyValidation,
+      request_url: "https://nvd.nist.gov/developers/request-an-api-key",
+    });
   }
 
   if (url.pathname === "/api/run" && req.method === "POST") {
@@ -256,6 +292,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
 // The dashboard endpoints answer from a context without a session, so an assessment triggered in
 // the browser gets the evidence package rather than a sampling request.
 const webCtx: ToolContext = { config, store, http, clientSampling: () => false, sample: async () => null };
+
+/** The outcome of the background key probe started at launch, for the dashboard badge. */
+let nvdKeyValidation: { valid: boolean; error?: string; at: string } | null = null;
 
 function serveHtml(res: ServerResponse): void {
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
@@ -317,6 +356,24 @@ async function main(): Promise<void> {
     process.stderr.write(`  web interface   http://${bindHost}:${String(port)}\n`);
   }
   process.stderr.write("  MCP transport   stdio — this terminal stays attached to the agent\n");
+
+  // The key line is the operator's first hint at which lookup mode a check_cves will run in.
+  const keyState = resolveNvdKey(config);
+  if (keyState.key === null) {
+    process.stderr.write("  no valid NVD API key — check dashboard\n");
+    process.stderr.write(
+      "  running keyless, not optimal — rate limits apply, results may be less complete\n" +
+        "  https://github.com/prinzalx/winsecure-mcp/blob/main/docs/nvd-key-vs-keyless.md\n",
+    );
+  } else {
+    process.stderr.write(`  NVD API key     set (from ${keyState.source === "env" ? "NVD_API_KEY" : "config"}) — mode nvd-keyed\n`);
+    // A stored key is re-validated in the background, so a key that stopped working (typo, NVD
+    // revocation) prints the same honest line again instead of silently querying into 401s.
+    void validateNvdKey(keyState.key, config.settings.httpTimeoutMs).then((check) => {
+      nvdKeyValidation = { ...check, at: new Date().toISOString() };
+      if (!check.valid) process.stderr.write("  no valid NVD API key — check dashboard\n");
+    });
+  }
   process.stderr.write("\n");
 
   // stdio is the MCP transport; the web interface keeps running in the same process.

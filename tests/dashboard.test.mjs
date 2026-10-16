@@ -38,6 +38,7 @@ function state(store) {
     tools: [],
     activity: [],
     clientSampling: null,
+    nvdKey: { present: false, source: null },
   });
 }
 

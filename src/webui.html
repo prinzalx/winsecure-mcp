@@ -111,6 +111,18 @@
       details .body { color: var(--muted); margin-top: 8px; white-space: pre-wrap; }
       code { font-family: Consolas, monospace; }
       .empty { color: var(--muted); padding: 14px; }
+      input[type="text"] {
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 7px 10px;
+        font: 12px Consolas, monospace;
+        min-width: 300px;
+      }
+      .keyrow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+      .pill.mode-keyed { color: var(--green); border-color: var(--green); }
+      .pill.mode-keyless { color: var(--yellow); border-color: var(--yellow); }
       footer { color: var(--muted); font-size: 12px; margin-top: 36px; }
       #runlog {
         margin-top: 10px;
@@ -141,6 +153,9 @@
         <button id="btn-refresh">refresh view</button>
       </div>
       <div id="runlog"></div>
+
+      <h2>NVD API key</h2>
+      <div id="nvdkey"></div>
 
       <h2>Inventory</h2>
       <div class="cards" id="inv-cards"></div>
@@ -177,10 +192,32 @@
         return `<div class="card"><div class="num">${esc(num)}</div><div class="label">${esc(label)}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ""}</div>`;
       }
 
+      /** As `card`, but the number slot takes markup (a pill) instead of text. */
+      function cardHtml(html, label, sub) {
+        return `<div class="card"><div class="num" style="font-size:14px">${html}</div><div class="label">${esc(label)}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ""}</div>`;
+      }
+
+      // Survives the periodic re-render, so a key typed in the field is not wiped by refresh().
+      let keyDraft = "";
+
       function render(state) {
         $("#meta").textContent =
           `v${state.version} · ${state.store_exists ? "store present" : "no scan stored yet"}` +
           ` · client sampling ${state.client_sampling === null ? "— no client yet" : state.client_sampling ? "yes" : "no"}`;
+
+        const cve = state.cve ?? { mode: null, key_present: false, key_source: null };
+        const modePill = `<span class="pill ${cve.mode === "nvd-keyed" ? "mode-keyed" : "mode-keyless"}">${esc(cve.mode ?? "no lookup yet")}</span>`;
+        $("#nvdkey").innerHTML =
+          `<div class="keyrow">${modePill}` +
+          `<span class="pill ${cve.key_present ? "mode-keyed" : "mode-keyless"}">${cve.key_present ? `key set (${esc(cve.key_source ?? "?")})` : "no key"}</span>` +
+          `<input id="key-input" type="text" placeholder="paste a new NVD API key" autocomplete="off" value="${esc(keyDraft)}" />` +
+          `<button id="btn-key">save</button>` +
+          `<button id="btn-key-clear">clear</button>` +
+          `<span class="muted" id="key-msg"></span></div>` +
+          `<div class="muted" style="margin-top:8px">` +
+          `Get a key free at <a href="https://nvd.nist.gov/developers/request-an-api-key">nvd.nist.gov/developers/request-an-api-key</a>. ` +
+          `Keyed NVD queries every installed product; keyless falls back to an OSV batch plus the product cache and answers less completely. ` +
+          `<a href="https://github.com/prinzalx/winsecure-mcp/blob/main/docs/nvd-key-vs-keyless.md">Keyed vs keyless</a></div>`;
 
         const inv = state.inventory;
         $("#inv-cards").innerHTML =
@@ -195,6 +232,7 @@
           card(t.total, "todos total", `${t.open} open · ${t.assessed} assessed · ${t.dismissed} dismissed`) +
           card(t.kev, "KEV entries", "actively exploited (CISA)") +
           card(t.open, "still open", "not judged yet") +
+          cardHtml(modePill, "cve lookup mode", cve.mode === null ? "run check_cves" : cve.mode === "nvd-keyed" ? "complete per-product answers" : "OSV batch + cache — less complete") +
           (t.assessed_share === null ? card("—", "assessed share", "nothing to judge") : card(`${t.assessed_share}%`, "assessed share", "of non-dismissed"));
 
         const sev = t.by_severity;
@@ -275,6 +313,52 @@
 
       $("#btn-scan").addEventListener("click", () => runTool("scan_inventory"));
       $("#btn-check").addEventListener("click", () => runTool("check_cves"));
+      async function saveKey(key) {
+        const msg = $("#key-msg");
+        const buttons = document.querySelectorAll("#nvdkey button");
+        buttons.forEach((b) => (b.disabled = true));
+        msg.textContent = "validating…";
+        try {
+          const res = await fetch("/api/nvd_key", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ key }),
+          });
+          const body = await res.json();
+          msg.textContent = res.ok ? (body.key_present ? "saved — running nvd-keyed" : "cleared — running keyless") : `rejected: ${body.error ?? "invalid key"}`;
+          if (!res.ok) $("#runlog").textContent = `[nvd_key] ${body.error ?? "invalid key"}`;
+        } catch (err) {
+          msg.textContent = String(err);
+        }
+        buttons.forEach((b) => (b.disabled = false));
+        await refresh();
+      }
+
+      // The field is emptied on every redraw, so its value is read before render() replaces the
+      // markup; a key typed during the 15 s refresh cycle is not lost.
+      document.addEventListener("input", (ev) => {
+        if (ev.target?.id === "key-input") keyDraft = ev.target.value;
+      });
+      document.addEventListener("click", (ev) => {
+        if (ev.target?.id === "btn-key") {
+          const field = $("#key-input");
+          const value = field ? field.value.trim() : "";
+          if (value === "") {
+            $("#key-msg").textContent = "paste a key first";
+            return;
+          }
+          keyDraft = "";
+          void saveKey(value);
+          field.value = "";
+        }
+        if (ev.target?.id === "btn-key-clear") {
+          keyDraft = "";
+          const field = $("#key-input");
+          if (field) field.value = "";
+          void saveKey("");
+        }
+      });
+
       $("#btn-refresh").addEventListener("click", refresh);
       refresh();
       setInterval(refresh, 15000);

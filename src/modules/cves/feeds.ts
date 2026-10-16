@@ -522,9 +522,11 @@ export async function nvdCveDetail(
   http: Http,
   timeoutOnlyMs: number,
   cveId: string,
+  /** A valid NVD key raises the rate limit; it is appended so the cached answer is per key. */
+  apiKey?: string | null,
 ): Promise<{ data: unknown | null; error?: string; from: CachedFetch["from"] }> {
   void timeoutOnlyMs;
-  const url = `${NVD_API}?cveId=${encodeURIComponent(cveId)}`;
+  const url = `${NVD_API}?cveId=${encodeURIComponent(cveId)}${apiKey ? `&apiKey=${encodeURIComponent(apiKey)}` : ""}`;
   const res = await http.get(url, 24 * 60 * 60 * 1000);
   if (!res.body) return { data: null, error: res.error ?? "NVD unreachable", from: "none" };
   try {

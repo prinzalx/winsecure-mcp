@@ -20,6 +20,8 @@ export interface BinaryFetch {
 }
 
 export interface Http {
+  /** The disk-cache directory, so cached POSTs land next to the cached GETs. */
+  readonly cacheDir: string;
   /**
    * GET with a TTL disk cache.
    *
@@ -33,6 +35,72 @@ export interface Http {
    * so the cache entry of a binary url is stored base64-encoded under its own file.
    */
   getBinary(url: string, ttlMs: number): Promise<BinaryFetch>;
+}
+
+/**
+ * A TTL-cached JSON POST, shaped like {@link CachedFetch}.
+ *
+ * `Http` grew out of feed GETs, but the OSV batch endpoint is a POST whose answer deserves the
+ * same disk cache (an offline run must still answer from the last batch). The cache key is
+ * `url + body`, so two different query sets never share an entry, and a caller that asks twice
+ * within the TTL costs no network at all.
+ */
+export async function postCached(
+  cacheDir: string,
+  url: string,
+  body: string,
+  ttlMs: number,
+  headers?: Record<string, string>,
+  timeoutMs = 15_000,
+): Promise<CachedFetch> {
+  const offline = process.env.WSMD_OFFLINE === "1";
+  const file = join(cacheDir, `${safeName(`${url}|${body}`)}.post.cache.json`);
+
+  let cached: { body: string; fetched_at: string } | null = null;
+  try {
+    const entry = JSON.parse(readFileSync(file, "utf8")) as { body?: unknown; fetched_at?: unknown };
+    cached = typeof entry?.body === "string" ? { body: entry.body, fetched_at: String(entry.fetched_at ?? "") } : null;
+  } catch {
+    cached = null;
+  }
+  if (cached) {
+    const age = Date.now() - Date.parse(cached.fetched_at);
+    if (Number.isFinite(age) && age >= 0 && age < ttlMs) {
+      return { body: cached.body, from: "cache", fetched_at: cached.fetched_at };
+    }
+  }
+
+  if (!offline) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json", ...headers },
+        body,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const text = await res.text();
+      if (res.ok) {
+        const entry = { body: text, fetched_at: new Date().toISOString() };
+        try {
+          mkdirSync(cacheDir, { recursive: true });
+          writeFileSync(file, JSON.stringify(entry), "utf8");
+        } catch {
+          // An unwritable cache costs one more call, nothing else.
+        }
+        return { body: entry.body, from: "network", fetched_at: entry.fetched_at };
+      }
+      const detail = `HTTP ${String(res.status)}`;
+      if (cached) return { body: cached.body, from: "stale_cache", fetched_at: cached.fetched_at, error: detail };
+      return { body: null, from: "none", fetched_at: null, error: detail };
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      if (cached) return { body: cached.body, from: "stale_cache", fetched_at: cached.fetched_at, error: message };
+      return { body: null, from: "none", fetched_at: null, error: message };
+    }
+  }
+
+  if (cached) return { body: cached.body, from: "stale_cache", fetched_at: cached.fetched_at, error: "offline" };
+  return { body: null, from: "none", fetched_at: null, error: "offline" };
 }
 
 interface CacheFile {
@@ -82,6 +150,7 @@ export function createHttp(cacheDir: string, timeoutMs: number): Http {
   };
 
   return {
+    cacheDir,
     async get(url, ttlMs) {
       const cached = readCache(url);
       if (cached) {

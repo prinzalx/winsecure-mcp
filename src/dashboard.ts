@@ -49,6 +49,15 @@ export interface DashboardState {
   store_exists: boolean;
   /** Sampling support of the stdio client currently attached, or null before the handshake. */
   client_sampling: boolean | null;
+  /**
+   * How the CVE answers are obtained: the mode of the newest check_cves, plus the current NVD key
+   * status. A user must never confuse "no vulnerabilities" with a thin keyless answer.
+   */
+  cve: {
+    mode: string | null;
+    key_present: boolean;
+    key_source: string | null;
+  };
   inventory: {
     programs: number;
     scanned_at: string | null;
@@ -132,6 +141,7 @@ export function computeState(options: {
   tools: ToolDefinition[];
   activity: ActivityEntry[];
   clientSampling: boolean | null;
+  nvdKey: { present: boolean; source: string | null };
 }): DashboardState {
   const { store } = options;
 
@@ -171,6 +181,11 @@ export function computeState(options: {
     store_path: options.storePath,
     store_exists: options.storeExists,
     client_sampling: options.clientSampling,
+    cve: {
+      mode: store.cve_mode ?? null,
+      key_present: options.nvdKey.present,
+      key_source: options.nvdKey.source,
+    },
     inventory: {
       programs: store.inventory.length,
       scanned_at: lastScan,

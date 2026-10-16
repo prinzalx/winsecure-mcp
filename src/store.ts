@@ -9,6 +9,12 @@ export interface TodoFile {
   updated_at: string;
   inventory: InventoryEntry[];
   todos: Todo[];
+  /**
+   * The lookup mode (`nvd-keyed` / `keyless-osv+cached`) the newest `check_cves` ran in, so
+   * `list_todos` and the dashboard can tell a thin keyless answer from a clean machine even after
+   * the tool call that produced it is long gone.
+   */
+  cve_mode?: string | null;
 }
 
 export interface DataStore {
@@ -41,6 +47,7 @@ export function openStore(dir: string): DataStore {
           updated_at: typeof raw.updated_at === "string" ? raw.updated_at : new Date(0).toISOString(),
           inventory: Array.isArray(raw.inventory) ? (raw.inventory as InventoryEntry[]) : [],
           todos: Array.isArray(raw.todos) ? (raw.todos as Todo[]) : [],
+          cve_mode: typeof raw.cve_mode === "string" ? raw.cve_mode : null,
         };
       } catch {
         return { ...EMPTY, inventory: [], todos: [] };

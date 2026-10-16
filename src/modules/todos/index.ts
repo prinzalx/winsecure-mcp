@@ -46,7 +46,9 @@ export const todoTools: ToolDefinition[] = [
       "KEV marks it as actively exploited, and the assessment status.\n" +
       "Sort order is deliberate: a verified actively-exploited finding outranks every merely unverified name match, " +
       "because an unconfirmed KEV hit must never headline the list. Within that, severity and EPSS order the work.\n" +
-      "An empty list after check_cves is an answer, not a failure: it means no CVE matched the installed programs.",
+      "An empty list after check_cves is an answer, not a failure: it means no CVE matched the installed programs.\n" +
+      "The answer names the lookup mode of the newest check_cves (nvd-keyed / keyless-osv+cached), so a thin keyless\n" +
+      "answer is never mistaken for a clean machine. Without a check_cves run yet the mode is null.",
     input: z.object({
       status: z.enum(["open", "assessed", "dismissed", "all"]).optional().describe("Filter by status. Defaults to all non-dismissed"),
       kev_only: z.boolean().optional().describe("Only entries with at least one actively exploited CVE"),
@@ -69,9 +71,13 @@ export const todoTools: ToolDefinition[] = [
       const limit = typeof args.limit === "number" ? args.limit : 40;
       const shown = todos.slice(0, limit);
 
+      // Read from the store, not from a live lookup: the list must describe the run that produced
+      // it, even long after that call is gone.
+      const mode = store.cve_mode ?? null;
+      const more = todos.length > shown.length ? `\n…and ${String(todos.length - shown.length)} more` : "";
       return ok(
-        { count: todos.length, shown: shown.length, todos: shown },
-        `${summarize(shown)}${todos.length > shown.length ? `\n…and ${String(todos.length - shown.length)} more` : ""}`,
+        { count: todos.length, shown: shown.length, mode, todos: shown },
+        `${summarize(shown)}${more}${mode ? `\nlookup mode: ${mode}${mode === "keyless-osv+cached" ? " (keyless: results may be less complete)" : ""}` : "\nlookup mode: unknown — run check_cves"}`,
       );
     },
   },

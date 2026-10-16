@@ -44,7 +44,7 @@ client's log instead.
 ██║███╗██║██║██║╚██╗██║╚════██║██╔══╝  ██║     ██║   ██║██╔══██╗██╔══╝     ██║╚██╔╝██║██║     ██╔═══╝
 ╚███╔███╔╝██║██║ ╚████║███████║███████╗╚██████╗╚██████╔╝██║  ██║███████╗   ██║ ╚═╝ ██║╚██████╗██║
  ╚══╝╚══╝ ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝   ╚═╝     ╚═╝ ╚═════╝╚═╝
-  version         v0.5.1
+  version         v0.6.0
   data directory  C:\Users\<user>\AppData\Roaming\winsecure-mcp
   store file      C:\Users\<user>\AppData\Roaming\winsecure-mcp\winsecure.json
   web interface   http://0.0.0.0:8788
@@ -55,7 +55,9 @@ Open <http://127.0.0.1:8788> in a browser for the **web dashboard**: inventory a
 the severity breakdown, the top risks confirmed-KEV-first, an activity log of every call this server session
 answered, and the eight tools with their full docs. Its two buttons run `scan_inventory` and
 `check_cves` through the same handlers an agent calls, so the page can never disagree with a tool
-answer. `--no-web` (or `WSMD_NO_WEB=1`) keeps it stdio-only; `--port` / `WSMD_PORT` move it off 8788.
+answer. A **NVD API key** section shows the current lookup mode as a badge, takes a pasted key
+(validated against NVD before it is saved) and clears it again; the key itself never travels back to
+the browser. `--no-web` (or `WSMD_NO_WEB=1`) keeps it stdio-only; `--port` / `WSMD_PORT` move it off 8788.
 
 ### One process, two transports (the winadmin model)
 
@@ -100,9 +102,10 @@ status words and ISO-8601 UTC timestamps throughout, so the output is **locale-i
 result is an answer, not an error.
 
 Beyond the tools, the store file is exposed as a read-only MCP **resource** (`winsecure://store.json`),
-so an agent can inspect the inventory and to-do JSON without invoking a tool. `check_cves` reports
-`cvelist.index_coverage` (local CVEs vs. the estimated full corpus), which tells "no hits found" apart
-from "the local index is still thin".
+so an agent can inspect the inventory and to-do JSON without invoking a tool. Every `check_cves`
+answer names its `mode` (keyed NVD or the keyless fallback) and the `product_cache` counters, which
+tell "no hits found" apart from "the answer was thin"; `list_todos` repeats the mode of the run that
+produced the list.
 
 ## Inventory Sources
 
@@ -120,15 +123,39 @@ carries the list of sources that reported it.
 
 ## CVE Data Sources
 
-Measured live against the running APIs (Phase 0, 10/2026):
-
-| Source | Role | Finding |
+| Source | Role | Notes |
 |---|---|---|
-| **cvelistV5** (GitHub) | **primary** local CVE source | Full corpus is 602 MB, so the hourly **delta** (~5 MB) is downloaded and *accumulated* into a local index (`cache/cvelist-index.json`); coverage grows over days without the full download. CVE 5.0 schema (`containers.cna/adp`, `affected[].product/versions`). |
-| **CISA KEV** JSON feed | actively-exploited signal | Daily-cached. An exact product-name match hits only ~0.5 % of a real inventory (display name vs CVE product name), so an alias table + `match_confidence` bridge the gap. |
+| **NVD API 2.0** | **primary** — one query per installed product | `keywordSearch` on the product name, paged at 2000 per request. With an API key the limit is 50 requests / 30 s, keyless 5 / 30 s. Answers are cached per product with their `lastModified`, so later runs transfer only what changed. |
+| **OSV.dev** batch query | keyless fallback | `POST /v1/querybatch` answers the whole inventory in one request without a key. Covers OSS-packaged software well, proprietary Windows software poorly. |
+| **cvelistV5** (GitHub) | deprecated offline fallback | The pre-v0.6.0 model: hourly **delta** (~5 MB) accumulated into `cache/cvelist-index.json`. Only consulted when both the product cache and KEV are empty (a cold cache with no network). |
+| **CISA KEV** JSON feed | actively-exploited signal | Fully local in both modes — only ~1 700 entries, so it is the cheap critical signal. An exact product-name match hits only ~0.5 % of a real inventory (display name vs CVE product name), so an alias table + `match_confidence` bridge the gap. |
 | **EPSS** (FIRST) | prioritisation | Batch of ≤100 CVEs per call; fills `max_epss`. |
-| **OSV.dev** batch query | not used as primary | No `Windows` ecosystem and ~0 % hit-rate on classic desktop software. |
-| **NVD API 2.0** | `cve_detail` of a single CVE only | Keyless rate limit is 4 calls / 30 s; live-calls-per-program is not viable. |
+
+### How the CVE lookup works (since v0.6.0)
+
+Earlier releases were **corpus-centric**: download the cvelistV5 deltas, accumulate them into one
+local index, and grep that index for the installed products. On a fresh install that index starts
+at under 1 % coverage and takes days to grow, so "no vulnerability found" and "the CVE is not in
+the index yet" were indistinguishable — and the server stored a 602 MB library to answer questions
+about ~350 programs.
+
+Now the **inventory drives the lookup**. For each product name the inventory reports (deduplicated
+on the normalised name, installer artifacts excluded), `check_cves`:
+
+1. queries NVD for the CVE records that mention the product, paged, and filters them locally to the
+   product names that entry is known under;
+2. stores the answer in `cache/products.json` under the product's newest `lastModified`;
+3. on the next run asks only for changes since that timestamp (`lastModStartDate` /
+   `lastModEndDate`, inside NVD's 120-day window);
+4. applies the v0.5.x version verdict against the fetched affected ranges, so
+   `dropped_by_verdict` rejects a already-patched version from **complete** data on day one.
+
+Whether step 1 runs keyed or the whole thing falls back to a single OSV batch depends on the NVD
+API key: **`NVD_API_KEY`** in the environment wins, otherwise the key saved in the dashboard is
+used, otherwise the server runs keyless and says so — on the console
+(`no valid NVD API key — check dashboard`) and in every answer (`mode:
+"nvd-keyed" | "keyless-osv+cached"`). [`docs/nvd-key-vs-keyless.md`](docs/nvd-key-vs-keyless.md)
+compares the two in one table: cost, speed, completeness, update semantics.
 
 Everything is cached on disk with a TTL, and **a scan run never depends on the network**. Without
 network the server still returns the inventory with `cve_status: "unknown"`. Privacy: only product,
@@ -160,6 +187,9 @@ Defaults work out of the box; the server writes them out on first save.
 |---|---|---|
 | `dataDir` | store, caches and config | `%APPDATA%\winsecure-mcp` |
 | `kevTtlHours` / `cvelistTtlHours` / `epssTtlHours` | disk-cache TTLs | 24 |
+| `nvdApiKey` | NVD key saved from the dashboard (empty = keyless) | `null` |
+| `nvdProductsPerRun` | how many product answers one `check_cves` may refresh at NVD | 400 |
+| `nvdMaxPages` | page cap per product query, so Chrome cannot turn into 60 requests | 5 |
 | `portableExcludes` | paths never walked | see above |
 | `portableMaxResults` | cut-off for the portable walk | 40 |
 | `portableTimeoutMs` | portable walk budget | 60000 |
@@ -167,7 +197,8 @@ Defaults work out of the box; the server writes them out on first save.
 
 Environment overrides: `WSMD_CONFIG` (config file), `WSMD_DATA_DIR` (data directory),
 `WSMD_OFFLINE=1` (switch the network off — the offline test), `WSMD_HOST` / `WSMD_PORT` (the
-listener's bind address and port), `WSMD_NO_WEB` (the dashboard). CLI
+listener's bind address and port), `WSMD_NO_WEB` (the dashboard), `NVD_API_KEY` (overrides the key
+saved in the config). CLI
 `--host` / `--config` / `--data-dir` / `--port` / `--no-web` win.
 
 ## Development
@@ -186,7 +217,7 @@ node scripts/banner.mjs  # regenerate the console logo
 
 ```
 scan_inventory → 357 programs after dedup (registry 205, winget 209, portable 40 cut at max)
-check_cves     → cvelist index 1991 CVEs / 1169 products (0.7 % coverage, cold-start phase)
+check_cves     → mode nvd-keyed, product cache answers the whole inventory in one run
 list_todos     → the v0.5.0 verdict rules turned this run's 6 false positives into 1 unconfirmed row
 assess_todo    → evidence package returned (client cannot sample); saved via save_assessment
 cve_detail     → CVE-2024-21412: CVSS 8.1 — Internet Shortcut Files Security Feature Bypass
@@ -203,8 +234,10 @@ not in the thin 0.7 % index yet, and KEV membership exempts the pair from the er
 known-patched program stays as one low-confidence unconfirmed row rather than a claim of exposure.
 That is the intended leniency for KEV entries, not a hit ranked above a confirmed one.
 
-Offline test (`WSMD_OFFLINE=1`, cold cache): inventory 357 programs, `cve_status: "unknown"`,
-`source_errors: ["offline","offline"]`, no failures.
+Offline test (`WSMD_OFFLINE=1`, cold cache): inventory 357 programs, `cve_status: "unknown"`, the
+failure reason reported once per distinct message in `source_errors`, no failures. The same run
+keyless (no `NVD_API_KEY`, no saved key) reports `mode: "keyless-osv+cached"` and carries the
+keyless hint in `source_errors`, so a thin answer is never read as a clean machine.
 
 A second probe ran the server in a Linux (WSL) sandbox where neither `powershell.exe` nor
 `winget.exe` is reachable. That is what shaped the source-health rule: a scan on a host it cannot
@@ -282,7 +315,7 @@ src/
   store.ts            single JSON file for inventory + to-do list (atomic rename)
   utils/              result wrapper, powershell, net (TTL disk cache), matching, zip
   modules/inventory/  sources (registry/winget/portable) + dedupe
-  modules/cves/       feeds (KEV/cvelistV5/EPSS/NVD) + matching engine
+  modules/cves/       feeds (KEV/cvelistV5/EPSS/NVD) + products.ts (per-product lookup) + matching engine
   modules/todos/      todo model (schema, evidence, merge) + tools
 skills/windows-cve-triage/SKILL.md
 ```

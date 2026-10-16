@@ -2,10 +2,11 @@ import { z } from "zod";
 
 import type { ToolDefinition, ToolContext } from "../../types.js";
 import { fail, ok } from "../../utils/result.js";
-import { CVELIST_FULL_CORPUS_ESTIMATE, fetchEpss, kevForProduct, loadKev, loadProductIndex, nvdCveDetail } from "../cves/feeds.js";
-import { matchProgram, severityOf } from "../cves/engine.js";
-import { productFamily } from "../../utils/matching.js";
-import type { CveHit } from "../../model.js";
+import { CVELIST_FULL_CORPUS_ESTIMATE, fetchEpss, kevForProduct, loadKev, loadProductIndex, nvdCveDetail, type ProductIndex } from "../cves/feeds.js";
+import { candidates, matchProgram, severityOf } from "../cves/engine.js";
+import { lookupProducts, resolveNvdKey } from "./products.js";
+import { normName, productFamily } from "../../utils/matching.js";
+import type { CveHit, InventoryEntry } from "../../model.js";
 import { groupMatchesIntoTodos, mergeTodo } from "../todos/todo.js";
 
 /** Extracts the english description and the highest CVSS out of an NVD API 2.0 answer. */
@@ -27,6 +28,32 @@ function nvdFields(cve: Record<string, unknown>): { cvss: number | null; descrip
 
 /** How many unscored CVEs one `check_cves` run may look up at NVD (keyless rate limit is 4 / 30 s). */
 const NVD_ENRICH_CAP = 20;
+
+/**
+ * Every product name the inventory stands for, deduplicated, as the lookup wants it.
+ *
+ * The same candidate list the engine matches with drives the queries, so a name that could
+ * produce a hit is a name that was asked about. Each entry's `wanted` set names exactly its own
+ * normalised form: the engine's per-candidate lookup then finds this product's answer and nothing
+ * else, which is what keeps one cache entry per installed program instead of a corpus copy.
+ */
+export function productNames(inventory: InventoryEntry[]): { name: string; wanted: Set<string>; version: string | null }[] {
+  const wanted = new Map<string, { set: Set<string>; version: string | null }>();
+  for (const entry of inventory) {
+    if (entry.installer_artifact === true) continue;
+    for (const cand of candidates(entry)) {
+      const key = normName(cand.name);
+      if (key === "") continue;
+      const known = wanted.get(key) ?? { set: new Set<string>(), version: null };
+      known.set.add(key);
+      // OSV rejects a batch query with neither a version nor a commit, so the installed version
+      // rides along with the name. NVD's keyword search simply ignores it.
+      if (known.version === null && entry.version) known.version = entry.version;
+      wanted.set(key, known);
+    }
+  }
+  return [...wanted.entries()].map(([name, { set, version }]) => ({ name, wanted: set, version }));
+}
 
 /**
  * Fills the missing CVSS of KEV hits from the cached NVD answer.
@@ -57,7 +84,7 @@ export async function enrichKevHits(ctx: ToolContext, hits: CveHit[]): Promise<n
       for (const hit of targets) hit.cvss_source = "nvd_unreachable";
       continue;
     }
-    const res = await nvdCveDetail(ctx.http, ctx.config.settings.httpTimeoutMs, cveId);
+    const res = await nvdCveDetail(ctx.http, ctx.config.settings.httpTimeoutMs, cveId, resolveNvdKey(ctx.config).key);
     const first = res.data
       ? ((res.data as { vulnerabilities?: { cve?: Record<string, unknown> }[] }).vulnerabilities ?? [])[0]
       : undefined;
@@ -96,15 +123,18 @@ export const cveTools: ToolDefinition[] = [
     module: "cves",
     title: "Check CVEs",
     description:
-      "Match the stored inventory against the local CVE sources (cvelistV5 delta, CISA KEV, EPSS) and fill the ToDo list. Never requires the network.",
+      "Match the stored inventory against the CVE sources (per-product NVD lookup, CISA KEV, EPSS) and fill the ToDo list. Never requires the network.",
     docs:
       "Offline rule: the run never depends on the network. Every source is read from its disk cache when the cache is " +
       "fresh; when the network is down the expired cache is still used, and only a cold cache with no network yields " +
       "cve_status: \"unknown\" with the inventory left untouched by the CVE layer.\n" +
-      "The cvelistV5 delta is accumulated into a local index on every run that finds a newer release, so coverage grows " +
-      "over days without the full 602 MB download. The answer reports how much the index currently covers. The counters " +
-      "are expected to be monotonic: when a merged index ends up smaller than the file it replaced, the run warns on " +
-      "stderr and names the drop in source_errors instead of quietly losing the accumulation.\n" +
+      "Since v0.6.0 the inventory drives the lookup: each installed product is queried at NVD API 2.0 and its answer is " +
+      "cached per product, so coverage is complete on day one instead of growing with the corpus. The answer reports the " +
+      "mode and the cache stats. With a valid NVD key the mode is nvd-keyed (50 requests per 30 s); without one the " +
+      "server falls back to keyless-osv+cached — one OSV batch query plus whatever the product cache already holds — " +
+      "which is thinner, and the answer says so rather than letting a small hit count look like a clean machine.\n" +
+      "The pre-v0.6.0 cvelist delta index is kept as the offline fallback and its counters are still reported, marked " +
+      "deprecated, for one more release.\n" +
       "EPSS is looked up for every matched CVE — unconfirmed name matches included — and an unreachable feed appears in " +
       "source_errors as an epss entry, so a null score is never silent.\n" +
       "Matching is name-based and carries a confidence per hit; an unsure match is reported with match_confidence and " +
@@ -127,10 +157,33 @@ export const cveTools: ToolDefinition[] = [
       const ttl = (h: number) => (args.refresh === true ? 0 : h * 60 * 60 * 1000);
       const cacheDir = `${settings.dataDir}/cache`;
 
-      const [kev, index] = await Promise.all([
+      const [kev, lookup] = await Promise.all([
         loadKev(ctx.http, ttl(settings.kevTtlHours)),
-        loadProductIndex(ctx.http, ttl(settings.cvelistTtlHours), cacheDir),
+        lookupProducts({
+          http: ctx.http,
+          config: ctx.config,
+          cacheDir,
+          names: productNames(store.inventory),
+          ttlMs: ttl(settings.cvelistTtlHours),
+          force: args.refresh === true,
+        }),
       ]);
+
+      // The product cache is the primary source now. Only when it answers nothing at all (a cold
+      // cache plus no network) does the run fall back to whatever the legacy cvelist delta index
+      // still provides, so an offline host with an old store keeps answering.
+      let index: ProductIndex = {
+        byProduct: lookup.byProduct,
+        byCve: lookup.byCve,
+        totalCves: lookup.byCve.size,
+        products: lookup.byProduct.size,
+        fetched_at: lookup.stats.fetched_at,
+        from: lookup.stats.refreshed > 0 ? "network" : lookup.stats.products_cached > 0 ? "cache" : "none",
+      };
+      if (index.byProduct.size === 0 && kev.byCve.size === 0) {
+        const legacy = await loadProductIndex(ctx.http, ttl(settings.cvelistTtlHours), cacheDir);
+        if (legacy.byProduct.size > 0) index = legacy;
+      }
 
       const dataAvailable = index.byProduct.size > 0 || kev.byCve.size > 0;
       const cveStatus: "checked" | "unknown" = dataAvailable ? "checked" : "unknown";
@@ -200,6 +253,7 @@ export const cveTools: ToolDefinition[] = [
       const seen = new Set(newTodos.map((t) => t.id));
       store.todos = [...newTodos, ...dismissed.filter((t) => !seen.has(t.id))];
       store.updated_at = new Date().toISOString();
+      store.cve_mode = lookup.stats.mode;
       ctx.store.save(store);
 
       return ok(
@@ -226,7 +280,18 @@ export const cveTools: ToolDefinition[] = [
           /** Unscored KEV hits this run completed from NVD (the cached helper); the rest stay marked unenriched. */
           nvd_enriched: nvdEnriched,
           kev: { total: kev.total, from: kev.from, fetched_at: kev.fetched_at },
+          /** How the CVE answers were obtained: keyed NVD or the keyless OSV-plus-cache fallback. */
+          mode: lookup.stats.mode,
+          nvd_key: lookup.stats.mode === "nvd-keyed" ? resolveNvdKey(ctx.config).source : null,
+          product_cache: {
+            products_cached: lookup.stats.products_cached,
+            refreshed: lookup.stats.refreshed,
+            deferred: lookup.stats.deferred,
+            fetched_at: lookup.stats.fetched_at,
+          },
+          /** Deprecated: the pre-v0.6.0 cvelist delta index, kept as the offline fallback. */
           cvelist: {
+            deprecated: true,
             cves: index.totalCves,
             products: index.products,
             from: index.from,
@@ -238,11 +303,20 @@ export const cveTools: ToolDefinition[] = [
             },
           },
           todos: store.todos.length,
-          source_errors: [kev.error, index.error, epssError].filter((e): e is string => Boolean(e)),
+          source_errors: [
+            kev.error,
+            ...(lookup.stats.mode === "keyless-osv+cached"
+              // The console hint belongs in the answer too: a keyless run must never read as a
+              // claim of completeness.
+              ? ["running keyless, not optimal — rate limits apply, results may be less complete (no valid NVD API key — check dashboard)"]
+              : []),
+            ...lookup.stats.errors,
+            epssError,
+          ].filter((e): e is string => Boolean(e)),
         },
         cveStatus === "unknown"
           ? `No CVE data reachable: inventory kept, ${String(store.todos.length)} todo(s) unchanged.`
-          : `${String(hitsTotal)} CVE hit(s) on ${String(programsChecked)} program(s), ${String(kevHits)} actively exploited` +
+          : `${String(hitsTotal)} CVE hit(s) on ${String(programsChecked)} program(s) [${lookup.stats.mode}], ${String(kevHits)} actively exploited` +
             `${unconfirmedTotal > 0 ? `, ${String(unconfirmedTotal)} unconfirmed (name match only, excluded from severity)` : ""}` +
             `${droppedByVerdict > 0 ? `, ${String(droppedByVerdict)} name match(es) rejected by the version verdict` : ""}` +
             `${skippedInstallerArtifacts > 0 ? `, ${String(skippedInstallerArtifacts)} installer artifact(s) skipped` : ""}. ` +
@@ -263,7 +337,7 @@ export const cveTools: ToolDefinition[] = [
     }),
     handler: async (args, ctx) => {
       const cveId = String(args.cve_id).toUpperCase();
-      const res = await nvdCveDetail(ctx.http, ctx.config.settings.httpTimeoutMs, cveId);
+      const res = await nvdCveDetail(ctx.http, ctx.config.settings.httpTimeoutMs, cveId, resolveNvdKey(ctx.config).key);
       if (!res.data) return fail(`cve_detail for ${cveId}: ${res.error ?? "no answer"}`);
 
       const body = res.data as { totalResults?: number; vulnerabilities?: unknown[] };

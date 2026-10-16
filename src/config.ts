@@ -40,6 +40,21 @@ export interface Settings {
   cvelistTtlHours: number;
   /** TTL of an EPSS answer on disk. */
   epssTtlHours: number;
+  /**
+   * The NVD API key saved through the dashboard. `NVD_API_KEY` in the environment wins over it;
+   * without either the server runs the keyless OSV-plus-cache fallback.
+   */
+  nvdApiKey: string | null;
+  /**
+   * How many product answers one `check_cves` run may refresh at NVD at most.
+   *
+   * Defaults above a realistic inventory (~350 programs) so a cold start with a key answers the
+   * whole machine in one run — the acceptance for "complete on day one" — while later runs only
+   * see the few products a scan added.
+   */
+  nvdProductsPerRun: number;
+  /** Page cap per product query, so a huge product (Chrome) cannot turn into 60 requests. */
+  nvdMaxPages: number;
   /** Root paths never walked by the portable-app scan. */
   portableExcludes: string[];
   /** Maximum portable `.exe` hits kept before the result is cut (the paths are still reported). */
@@ -104,6 +119,9 @@ export function loadConfig(): ConfigStore {
     kevTtlHours: 24,
     cvelistTtlHours: 24,
     epssTtlHours: 24,
+    nvdApiKey: null,
+    nvdProductsPerRun: 400,
+    nvdMaxPages: 5,
     portableExcludes: [...DEFAULT_EXCLUDES],
     portableMaxResults: 40,
     portableTimeoutMs: 60_000,
@@ -123,6 +141,9 @@ export function loadConfig(): ConfigStore {
     settings.kevTtlHours = num(file.kevTtlHours, settings.kevTtlHours);
     settings.cvelistTtlHours = num(file.cvelistTtlHours, settings.cvelistTtlHours);
     settings.epssTtlHours = num(file.epssTtlHours, settings.epssTtlHours);
+    if (typeof file.nvdApiKey === "string" && file.nvdApiKey !== "") settings.nvdApiKey = file.nvdApiKey;
+    settings.nvdProductsPerRun = num(file.nvdProductsPerRun, settings.nvdProductsPerRun);
+    settings.nvdMaxPages = num(file.nvdMaxPages, settings.nvdMaxPages);
     if (Array.isArray(file.portableExcludes)) settings.portableExcludes = file.portableExcludes.map(String);
     settings.portableMaxResults = num(file.portableMaxResults, settings.portableMaxResults);
     settings.portableTimeoutMs = num(file.portableTimeoutMs, settings.portableTimeoutMs);

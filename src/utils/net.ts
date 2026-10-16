@@ -16,6 +16,12 @@ export interface CachedFetch {
   status?: number;
   /** `Retry-After` of a 429 answer in milliseconds, when NVD sent the header. */
   retryAfterMs?: number;
+  /**
+   * Response body text of a failed network attempt, when there was one. Since v0.6.5 the product
+   * lookup reads it to tell NVD's real "zero matches" 404 envelope apart from Cloudflare's plain
+   * error page, which the status code alone could not distinguish.
+   */
+  bodyText?: string;
 }
 
 export interface BinaryFetch {
@@ -190,8 +196,9 @@ export function createHttp(cacheDir: string, timeoutMs: number): Http {
           }
           const detail = `HTTP ${String(res.status)}`;
           const retryAfterMs = readRetryAfterMs(res.headers);
-          if (cached) return { body: cached.body, from: "stale_cache", fetched_at: cached.fetched_at, error: detail, status: res.status, retryAfterMs };
-          return { body: null, from: "none", fetched_at: null, error: detail, status: res.status, retryAfterMs };
+          const bodyText = await res.text().catch(() => "");
+          if (cached) return { body: cached.body, from: "stale_cache", fetched_at: cached.fetched_at, error: detail, status: res.status, retryAfterMs, bodyText };
+          return { body: null, from: "none", fetched_at: null, error: detail, status: res.status, retryAfterMs, bodyText };
         } catch (cause) {
           const message = cause instanceof Error ? cause.message : String(cause);
           if (cached) {

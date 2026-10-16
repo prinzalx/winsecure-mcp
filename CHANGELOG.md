@@ -2,6 +2,36 @@
 
 All notable changes to winsecure-mcp are documented here.
 
+## 0.6.5 — 2026-10-16
+
+Fixes the keyed NVD cold start of the second live beta (7 runs over ~2 h, key active, 357 programs):
+`products_cached` stayed 0 of 428, `deferred` stayed 28, hits stayed 1 — every run began at the same
+products (7-zip, git, edge, whatsapp), and between runs zero NVD requests happened.
+
+- **The queue position is persisted** (per product: `pending`/`done`/`not_found`/`failed_transient`,
+  last attempt, attempt count). A `check_cves` continues at the queue's current position instead of
+  restarting at the inventory front, and a freshly failed product moves to the back (round-robin), so
+  a permanent failure can no longer block the queue. `deferred` is computed from this state and falls
+  monotonically towards 0 across runs.
+- **A 404 counts as a valid answer when its body is an NVD envelope** ("zero CVEs match this
+  product"): cached as `not_found` with a configurable TTL (default 7 days, was 6 h), no retry in the
+  same or the next run, counted apart from failures (`not_found`, not `failed`), and it never marks
+  the product enriched. A 404 with an empty or foreign body — key flakiness, Cloudflare's error page
+  — stays transient. Verified against the live endpoint with curl using exactly the URLs this server
+  builds: unknown keyword without a key answers `200 totalResults:0`, a rejected key answers `404`
+  with an empty body, a Cloudflare burst answers `429` `error code: 1015` with `Retry-After: 0`.
+- **Idle drain**: the NVD queue is worked by a server timer (`nvdIdleDrainMs`/`nvdIdleDrainBatch`)
+  independently of calls, armed at server start and after every `check_cves`, stopped cleanly on
+  shutdown and when the key is removed, and it continues without a restart on a hot key change.
+  A call still returns within `nvdCallBudgetMs` and never cancels the drain.
+- **Burst pacing**: no salvos — even spacing with small jitter (`nvdJitterPct`) and concurrency 1–2,
+  limit per 30 s window configurable (default 50/30 s, NVD's documented keyed limit). On 429 (the
+  Cloudflare body included) `Retry-After` is honored, the whole queue pauses, and the exponential
+  backoff has a configurable cap (`nvdBackoffCapMs`) — which matters because Cloudflare sends
+  `Retry-After: 0`.
+- The failed-request body now travels on `CachedFetch.bodyText`; the per-product 429/404 activity-log
+  lines mark idle-drain entries with `(idle drain)`.
+
 ## 0.6.3 — 2026-10-16
 
 Fixes the keyed NVD cold start reported by the live beta: a parallel salvo ate HTTP 429 on

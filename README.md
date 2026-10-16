@@ -44,7 +44,7 @@ client's log instead.
 ██║███╗██║██║██║╚██╗██║╚════██║██╔══╝  ██║     ██║   ██║██╔══██╗██╔══╝     ██║╚██╔╝██║██║     ██╔═══╝
 ╚███╔███╔╝██║██║ ╚████║███████║███████╗╚██████╗╚██████╔╝██║  ██║███████╗   ██║ ╚═╝ ██║╚██████╗██║
  ╚══╝╚══╝ ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝   ╚═╝     ╚═╝ ╚═════╝╚═╝
-  version         v0.6.3
+  version         v0.6.5
   data directory  C:\Users\<user>\AppData\Roaming\winsecure-mcp
   store file      C:\Users\<user>\AppData\Roaming\winsecure-mcp\winsecure.json
   web interface   http://0.0.0.0:8788
@@ -169,10 +169,21 @@ version and (when present) package id leave the machine — never paths, usernam
 The **first run needs time**, especially keyed: 425 products at NVD's 50-requests-per-30-window
 are minutes of work, not seconds. `check_cves` therefore does not block until the last product —
 it answers after a time budget (`nvdCallBudgetMs`, default 20 s, well under a typical MCP client
-transport timeout), products with a KEV hit asked first, and the rest of the queue drains in the
-background or on the next call. A failed lookup is not marked done: transient failures (429, 404,
-5xx, timeouts) stay deferred and are retried, only a real zero-result answer is cached briefly as
-`not_found`. Expect **several runs** before the NVD data is fully cached.
+transport timeout), products with a KEV hit asked first, and the rest stays in a **persistent
+queue** the server works on its own: an idle-drain timer (`nvdIdleDrainMs`) keeps fetching between
+calls, so progress no longer depends on how often a client happens to call.
+
+Two rules make the queue finish instead of circling (both since v0.6.5):
+
+- **Position is stored per product.** Every product carries its queue state (`pending`, `done`,
+  `not_found`, `failed_transient`) with attempt count and time. A product that fails moves to the
+  **back** of the queue, so the next call starts at the products that have never been asked — not
+  again at 7-zip, git, edge, whatsapp. `product_cache.deferred` is the queue's open remainder and
+  falls towards 0 across runs.
+- **A 404 is a real answer when its body is an NVD envelope** ("this product matches zero CVEs"): it
+closes the product for `nvdNotFoundTtlHours` (default 7 days) and counts as `not_found`, not as a
+failure and never as an enrichment. A 404 with an empty or foreign body — the key-flakiness and
+Cloudflare shapes — stays transient and is retried.
 
 The answer says how far it got:
 
@@ -188,10 +199,11 @@ The answer says how far it got:
 
 **Few hits right after installation mean the data source was not fully reached yet, not
 "patched".** Check `completeness.status` (and the additive `checked_data` field, which sits next
-to the untouched `cve_status`) before concluding; re-run `check_cves` after a few minutes until it
-says `complete`. Progress is visible in `product_cache` (`products_cached` climbing, `deferred`
-falling towards 0) and on the dashboard's activity log, which since v0.6.3 names the product
-behind every per-product HTTP 429/404.
+to the untouched `cve_status`) before concluding; while `warming_up` is true the server is still
+fetching on its own, so simply looking again after a few minutes is enough. Progress is visible in
+`product_cache` (`products_cached` climbing, `deferred` falling towards 0) and on the dashboard's
+activity log, which since v0.6.3 names the product behind every per-product HTTP 429/404 (lines
+marked `(idle drain)` come from the background timer rather than a call).
 
 ## The Assessment Mechanism (§5)
 
@@ -224,8 +236,12 @@ Defaults work out of the box; the server writes them out on first save.
 | `nvdMaxPages` | page cap per product query, so Chrome cannot turn into 60 requests | 5 |
 | `nvdRatePerWindow` / `nvdWindowMs` | keyed NVD pacing: requests per window (NVD's documented keyed limit) | 50 / 30000 |
 | `nvdConcurrency` | NVD requests in flight at the same time | 1 |
-| `nvdCallBudgetMs` | time budget of the per-product walk inside one `check_cves` call; the rest drains in the background | 20000 |
-| `nvdNotFoundTtlHours` | how long a zero-result (not_found) NVD answer is trusted | 6 |
+| `nvdJitterPct` | randomised extra spacing per NVD request, in percent of the window interval — keeps a queue from leaving its pause as a salvo (v0.6.5) | 20 |
+| `nvdBackoffCapMs` | upper bound of the exponential 429 backoff | 60000 |
+| `nvdIdleDrainMs` | period of the server-side idle drain that works the NVD queue between calls (v0.6.5) | 30000 |
+| `nvdIdleDrainBatch` | open products one idle-drain tick processes at most (v0.6.5) | 5 |
+| `nvdCallBudgetMs` | time budget of the per-product walk inside one `check_cves` call; the rest stays queued for the idle drain | 20000 |
+| `nvdNotFoundTtlHours` | how long a zero-match (`not_found`) NVD answer is trusted | 168 |
 | `portableExcludes` | paths never walked | see above |
 | `portableMaxResults` | cut-off for the portable walk | 40 |
 | `portableTimeoutMs` | portable walk budget | 60000 |

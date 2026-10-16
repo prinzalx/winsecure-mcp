@@ -260,6 +260,91 @@ test("lookupProducts holds products back at the per-run budget and says so", asy
   assert.equal(result.stats.deferred, 2, "the budget is visible instead of silent");
 });
 
+test("a transient keyed failure leaves the product pending, not done", async (t) => {
+  const previousKey = process.env.NVD_API_KEY;
+  process.env.NVD_API_KEY = VALID_KEY;
+  const previousOffline = process.env.WSMD_OFFLINE;
+  process.env.WSMD_OFFLINE = "1";
+  const cacheDir = tempCacheDir();
+  t.after(() => {
+    if (previousKey === undefined) delete process.env.NVD_API_KEY;
+    else process.env.NVD_API_KEY = previousKey;
+    if (previousOffline === undefined) delete process.env.WSMD_OFFLINE;
+    else process.env.WSMD_OFFLINE = previousOffline;
+    rmSync(cacheDir, { recursive: true, force: true });
+  });
+
+  const names = [{ name: "git", wanted: new Set(["git"]) }];
+  const first = await lookupProducts({
+    http: offlineHttp(cacheDir),
+    config: configWith(null),
+    cacheDir,
+    names,
+    ttlMs: 24 * 60 * 60 * 1000,
+    force: false,
+  });
+  assert.equal(first.stats.failed_other, 1, "the offline failure is counted as transient");
+  assert.equal(first.stats.pending, 1, "a failed lookup is NOT done: the product stays pending");
+  assert.equal(first.stats.not_found, 0, "a failure is not a negative answer");
+});
+
+test("a keyless osv entry does not count fresh in keyed mode", async (t) => {
+  const previousKey = process.env.NVD_API_KEY;
+  const previousOffline = process.env.WSMD_OFFLINE;
+  process.env.WSMD_OFFLINE = "1";
+  const cacheDir = tempCacheDir();
+  t.after(() => {
+    if (previousKey === undefined) delete process.env.NVD_API_KEY;
+    else process.env.NVD_API_KEY = previousKey;
+    if (previousOffline === undefined) delete process.env.WSMD_OFFLINE;
+    else process.env.WSMD_OFFLINE = previousOffline;
+    rmSync(cacheDir, { recursive: true, force: true });
+  });
+
+  const names = [{ name: "git", wanted: new Set(["git"]), version: "2.49.1" }];
+  // A keyless run caches every product from the OSV batch (here: an unreachable batch, but the
+  // entry semantics are what matter — write one the way keyless would).
+  delete process.env.NVD_API_KEY;
+  const keyless = await lookupProducts({
+    http: offlineHttp(cacheDir),
+    config: configWith(null),
+    cacheDir,
+    names,
+    ttlMs: 24 * 60 * 60 * 1000,
+    force: false,
+  });
+  assert.equal(keyless.stats.mode, "keyless-osv+cached");
+
+  const { readFileSync, writeFileSync, mkdirSync } = await import("node:fs");
+  const file = `${cacheDir}/products.json`;
+  mkdirSync(cacheDir, { recursive: true });
+  writeFileSync(
+    file,
+    JSON.stringify({
+      schema: 1,
+      products: {
+        git: { name: "git", records: [{ cve_id: "CVE-2024-1000", product: "git", vendor: null, summary: null, published: null, cvss: null, range_from: null, range_below: null, fixed_version: null }], last_modified: null, fetched_at: new Date().toISOString(), source: "osv", truncated: false },
+      },
+    }),
+    "utf8",
+  );
+
+  process.env.NVD_API_KEY = VALID_KEY;
+  const keyed = await lookupProducts({
+    http: offlineHttp(cacheDir),
+    config: configWith(null),
+    cacheDir,
+    names,
+    ttlMs: 24 * 60 * 60 * 1000,
+    force: false,
+  });
+  // The osv entry must NOT count fresh in keyed mode: the run asks NVD again (offline that shows
+  // as a transient failure, which only happens for a product that was actually queried).
+  assert.equal(keyed.stats.failed_other, 1, "keyed mode re-queries an osv-sourced entry to enrich it");
+  assert.equal(keyed.stats.pending, 1, "a failed re-fetch leaves it pending, never fresh");
+  void readFileSync;
+});
+
 test("postCached answers from disk within the TTL and writes one file per body", async (t) => {
   const { createServer } = await import("node:http");
   const previous = process.env.WSMD_OFFLINE;

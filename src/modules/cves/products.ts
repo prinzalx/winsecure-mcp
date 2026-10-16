@@ -114,6 +114,12 @@ interface ProductCacheEntry {
   source: "nvd" | "osv";
   /** True when the answer was cut at the page cap rather than delivered whole. */
   truncated: boolean;
+  /**
+   * Set when NVD answered a full query with zero results: a genuine negative. Negative entries are
+   * only trusted for the short not-found TTL (since v0.6.3), because an NVD outage that presents
+   * as "no results" must not silence a product for a whole day.
+   */
+  not_found_at?: string | null;
 }
 
 interface ProductCacheFile {
@@ -131,6 +137,27 @@ export interface ProductLookupStats {
   deferred: number;
   fetched_at: string | null;
   errors: string[];
+  /** Every product name the run was asked about. */
+  products_total: number;
+  /**
+   * Products left without a fresh usable answer after this run (transient failures included, since
+   * a failed lookup is not done). The completeness judgement in `check_cves` reads this number.
+   */
+  pending: number;
+  /** Products whose lookup ended in HTTP 429 (the rate limit was hit). */
+  failed_429: number;
+  /**
+   * Products whose lookup ended in HTTP 404. With a key set NVD answers 404 flakily (observed
+   * live: an empty body with `Invalid parameter: apiKey.`), so a 404 is a transient failure here,
+   * not a "no such CVE" statement, and never cached as one.
+   */
+  failed_404: number;
+  /** Products whose lookup failed for another transient reason (5xx, timeout, network, offline). */
+  failed_other: number;
+  /** Products freshly answered with a negative (zero results) entry this run. */
+  not_found: number;
+  /** True when the per-call time budget ran out and the queue drain continues in the background. */
+  warm_up_running: boolean;
 }
 
 /**
@@ -163,6 +190,27 @@ class ProductCache {
 
   set(name: string, entry: ProductCacheEntry): void {
     this.data.products[normName(name)] = entry;
+  }
+
+  /**
+   * Whether an entry may answer for the product instead of a network fetch.
+   *
+   * Two rules came out of the v0.6.2 field runs (task 2): keyed mode demands a `source: "nvd"`
+   * entry — a keyless OSV entry carries bare CVE ids without CVSS or ranges, and counting it as
+   * fresh is exactly what left `refreshed: 0` and `nvd_enriched: 0` after a key was added — and a
+   * `not_found` negative is only trusted for the short not-found TTL, so a product silenced by an
+   * NVD oddity gets asked again soon. A product that failed transiently has no entry at all here
+   * and is retried, never treated as done.
+   */
+  isFresh(name: string, ttlMs: number, keyed: boolean, notFoundTtlMs: number, force: boolean): boolean {
+    if (force) return false;
+    const entry = this.get(name);
+    if (!entry) return false;
+    if (keyed && entry.source !== "nvd") return false;
+    const at = entry.not_found_at ?? entry.fetched_at;
+    const age = Date.now() - Date.parse(at);
+    if (!Number.isFinite(age) || age < 0) return false;
+    return age < (entry.not_found_at ? Math.min(ttlMs, notFoundTtlMs) : ttlMs);
   }
 
   get size(): number {
@@ -471,6 +519,11 @@ export async function lookupProducts(options: {
    * cold keyed start reaches the actively exploited products inside the first call's time budget.
    */
   priority?: Set<string>;
+  /**
+   * Called for every per-product HTTP failure worth an activity-log line (429 and 404, task 5).
+   * Optional because not every caller owns an activity log.
+   */
+  onStatus?: (product: string, status: number) => void;
 }): Promise<ProductLookupResult> {
   const { http, config, cacheDir, names } = options;
   const settings = config.settings;
@@ -488,6 +541,13 @@ export async function lookupProducts(options: {
   };
   let refreshed = 0;
   let deferred = 0;
+  let failed429 = 0;
+  let failed404 = 0;
+  let failedOther = 0;
+  let notFound = 0;
+
+  // Defensive defaults, so a config written before v0.6.3 (or a minimal test config) still paces.
+  const notFoundTtlMs = (settings.nvdNotFoundTtlHours ?? 6) * 60 * 60 * 1000;
 
   // Keyed mode is the only one that walks NVD per product, so the budget protects it. The keyless
   // path asks OSV in a single batch request no matter how many products it carries, so it can take
@@ -496,14 +556,7 @@ export async function lookupProducts(options: {
     ? Math.max(1, Math.round(settings.nvdProductsPerRun))
     : Math.max(1, names.length);
 
-  const stale = names.filter(({ name }) => {
-    const entry = cache.get(name);
-    if (!options.force && entry) {
-      const age = Date.now() - Date.parse(entry.fetched_at);
-      if (Number.isFinite(age) && age >= 0 && age < options.ttlMs) return false;
-    }
-    return true;
-  });
+  const stale = names.filter(({ name }) => !cache.isFresh(name, options.ttlMs, keyed, notFoundTtlMs, options.force));
 
   if (keyed) {
     // KEV-priority first, then whatever order the inventory produced; the slice below is the
@@ -521,7 +574,7 @@ export async function lookupProducts(options: {
 
     const runOne = async ({ name, wanted }: { name: string; wanted: Set<string> }): Promise<void> => {
       const prev = cache.get(name);
-      const since = options.force ? null : (prev?.last_modified ?? null);
+      const since = options.force ? null : (prev?.not_found_at ? null : (prev?.last_modified ?? null));
       const res = await nvdProductQuery(http, {
         name,
         wanted,
@@ -530,17 +583,34 @@ export async function lookupProducts(options: {
         maxPages: Math.max(1, Math.round(settings.nvdMaxPages)),
         throttle,
       });
-      if (res.status === 429) {
-        // The whole queue pauses on this answer (Retry-After wins over the exponential backoff).
+      const status = res.status ?? 0;
+      if (status === 429) {
+        // The whole queue pauses on this answer; the product keeps no cache entry and is asked
+        // again on the next run (a transient failure is not done, task 2).
         throttle.rateLimited(res.retryAfterMs);
+        failed429 += 1;
+        noteError(res.error ?? "HTTP 429");
+        options.onStatus?.(name, 429);
+        return;
       }
-      if (res.records.length === 0 && res.error) {
+      if (status === 404) {
+        // With a key set, NVD answers 404 flakily (observed live: empty body, `Invalid parameter:
+        // apiKey.`), so it counts as transient and is retried next run — caching it as "no CVEs"
+        // is what made the 404 totals jump 17→12→3→35 between runs.
+        failed404 += 1;
+        noteError(res.error ?? "HTTP 404");
+        options.onStatus?.(name, 404);
+        return;
+      }
+      if (res.error && res.records.length === 0) {
+        failedOther += 1;
         noteError(res.error);
         return;
       }
       throttle.succeeded();
       // Incremental answers only add and update; a full one (no `since`) also drops CVEs the
-      // product stopped being mentioned in.
+      // product stopped being mentioned in. A full answer with zero results is a negative marker
+      // with the short not-found TTL, not a day-fresh "done".
       const merged = mergeRecords(prev?.records ?? [], res.records, since === null);
       cache.set(name, {
         name,
@@ -549,7 +619,9 @@ export async function lookupProducts(options: {
         fetched_at: new Date().toISOString(),
         source: "nvd",
         truncated: res.truncated,
+        not_found_at: merged.length === 0 ? new Date().toISOString() : null,
       });
+      if (merged.length === 0) notFound += 1;
       refreshed += 1;
     };
 
@@ -639,6 +711,8 @@ export async function lookupProducts(options: {
     byProduct.set(normName(name), list);
   }
 
+  const pending = names.filter(({ name }) => !cache.isFresh(name, options.ttlMs, keyed, notFoundTtlMs, options.force)).length;
+
   return {
     byProduct,
     byCve,
@@ -651,6 +725,13 @@ export async function lookupProducts(options: {
       errors: [...errorCounts.entries()].map(([message, count]) =>
         count === 1 ? message : `${message} (${String(count)} products)`,
       ),
+      products_total: names.length,
+      pending,
+      failed_429: failed429,
+      failed_404: failed404,
+      failed_other: failedOther,
+      not_found: notFound,
+      warm_up_running: warmUpActive(cacheDir),
     },
   };
 }

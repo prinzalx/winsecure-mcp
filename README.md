@@ -44,7 +44,7 @@ client's log instead.
 ██║███╗██║██║██║╚██╗██║╚════██║██╔══╝  ██║     ██║   ██║██╔══██╗██╔══╝     ██║╚██╔╝██║██║     ██╔═══╝
 ╚███╔███╔╝██║██║ ╚████║███████║███████╗╚██████╗╚██████╔╝██║  ██║███████╗   ██║ ╚═╝ ██║╚██████╗██║
  ╚══╝╚══╝ ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝   ╚═╝     ╚═╝ ╚═════╝╚═╝
-  version         v0.6.5
+  version         v0.6.6
   data directory  C:\Users\<user>\AppData\Roaming\winsecure-mcp
   store file      C:\Users\<user>\AppData\Roaming\winsecure-mcp\winsecure.json
   web interface   http://0.0.0.0:8788
@@ -180,10 +180,23 @@ Two rules make the queue finish instead of circling (both since v0.6.5):
   **back** of the queue, so the next call starts at the products that have never been asked — not
   again at 7-zip, git, edge, whatsapp. `product_cache.deferred` is the queue's open remainder and
   falls towards 0 across runs.
-- **A 404 is a real answer when its body is an NVD envelope** ("this product matches zero CVEs"): it
-closes the product for `nvdNotFoundTtlHours` (default 7 days) and counts as `not_found`, not as a
-failure and never as an enrichment. A 404 with an empty or foreign body — the key-flakiness and
-Cloudflare shapes — stays transient and is retried.
+- **A 404 is classified by what NVD actually says, not by its status code alone.** Since v0.6.6 the
+  reason of a rejection lives in the `message` response header (the body is empty), and the four
+  shapes are treated apart:
+  | what NVD answers | state | what the server does |
+  |---|---|---|
+  | `200` with records | `done` | cached, product closed |
+  | `404` + body is an NVD envelope | `not_found` | real "zero CVEs" answer for `nvdNotFoundTtlHours` (default 7 days), counted apart from failures, never an enrichment |
+  | `404` + `message: Invalid apiKey.` (or `401`) | `key_rejected` | the key is the problem: the drain pauses and further requests go out **keyless** at the keyless limit |
+  | `404` + `message: Invalid parameter: …` | `request_invalid` | a request-building problem: logged per product, retried only `nvdRequestInvalidMaxAttempts` times, then closed out — not rotated forever |
+  | `404` with no message and no envelope | transient | Cloudflare/unknown shape, retried at the queue's back |
+  | `429` / `5xx` | transient | whole queue pauses with `Retry-After` and exponential backoff |
+- **The requests carry the key as the HTTP header `apiKey`, never as a query parameter.** NVD API
+  2.0 answers a query-parameter key with `404` and `message: Invalid parameter: apiKey.`, which is
+  what left the live beta's product cache at 0 while the mode still read `nvd-keyed`.
+- **A circuit breaker stops an endless rotation**: after `nvdBreakerThreshold` consecutive lookups
+  without a single `200` the drain pauses for `nvdBreakerPauseMs` and the answer says so, instead of
+  working through the queue at full speed and reporting nothing but failures.
 
 The answer says how far it got:
 
@@ -191,19 +204,33 @@ The answer says how far it got:
 "completeness": {
   "status": "incomplete",
   "warming_up": true,
-  "reasons": ["425 of 425 product lookups unanswered", "212 product(s) rate limited (HTTP 429)"],
-  "lookups": { "total": 425, "cached": 13, "deferred": 0, "failed_429": 212, "failed_404": 4, "failed_other": 3, "not_found": 6 },
-  "hint": "Results incomplete — the NVD data was not fully reached (cold cache and/or rate limits). This is NOT \"patched\": re-run check_cves after a few minutes and compare before drawing a conclusion."
+  "reasons": ["425 of 425 product lookups unanswered", "nvd_key_rejected"],
+  "lookups": { "total": 425, "cached": 13, "deferred": 412, "failed_429": 0, "failed_404": 4, "failed_other": 3, "not_found": 6, "done": 13, "failed_transient": 7, "failed_request_invalid": 0, "attempts_total": 20 },
+  "hint": "NVD API key rejected — check the key in the config (the dashboard shows the reason). Lookups continue keyless at the keyless rate; a low hit count is the data source, not a patched machine.",
+  "needs_attention": true
 }
 ```
+
+Since v0.6.6 `reasons` also carries three machine-readable tokens, so a client can tell a slow
+warm-up from a configuration problem it cannot wait out: **`nvd_key_rejected`** (the key is wrong —
+act), **`nvd_requests_invalid`** (the request shape is wrong — a bug, act), and
+**`nvd_all_lookups_failing`** (the circuit breaker is open — every recent lookup failed). When any
+of them is present the answer also carries `needs_attention: true`, and `hint` names the action
+instead of only describing the state.
 
 **Few hits right after installation mean the data source was not fully reached yet, not
 "patched".** Check `completeness.status` (and the additive `checked_data` field, which sits next
 to the untouched `cve_status`) before concluding; while `warming_up` is true the server is still
-fetching on its own, so simply looking again after a few minutes is enough. Progress is visible in
-`product_cache` (`products_cached` climbing, `deferred` falling towards 0) and on the dashboard's
-activity log, which since v0.6.3 names the product behind every per-product HTTP 429/404 (lines
-marked `(idle drain)` come from the background timer rather than a call).
+fetching on its own, so simply looking again after a few minutes is enough — unless
+`needs_attention` is set, which means waiting will not help and the key or the config needs a
+human. Progress is visible in `product_cache` (`products_cached` climbing, `deferred` falling
+towards 0) and on the dashboard's activity log, which since v0.6.3 names the product behind every
+per-product HTTP 429/404 with its timestamp (lines marked `(idle drain)` come from the background
+timer rather than a call).
+
+**The dashboard key badge distinguishes presence from validity (v0.6.6).** Green means NVD accepted
+the key, yellow a key that is saved but not yet proven, red one NVD refused. `/api/state` reports
+`key_present` and `key_valid` apart for the same reason: a saved key is not a working key.
 
 ## The Assessment Mechanism (§5)
 
@@ -235,6 +262,10 @@ Defaults work out of the box; the server writes them out on first save.
 | `nvdProductsPerRun` | how many product answers one `check_cves` may refresh at NVD | 400 |
 | `nvdMaxPages` | page cap per product query, so Chrome cannot turn into 60 requests | 5 |
 | `nvdRatePerWindow` / `nvdWindowMs` | keyed NVD pacing: requests per window (NVD's documented keyed limit) | 50 / 30000 |
+| `nvdKeylessRatePerWindow` | pacing once the key is absent or NVD rejected it (NVD's documented keyless limit, v0.6.6) | 5 |
+| `nvdBreakerThreshold` | consecutive lookups without one `200` that trip the circuit breaker (v0.6.6) | 20 |
+| `nvdBreakerPauseMs` | how long the drain rests once the breaker is open, or NVD refused the key (v0.6.6) | 900000 |
+| `nvdRequestInvalidMaxAttempts` | retries of a product NVD called an invalid request, before it is closed out (v0.6.6) | 3 |
 | `nvdConcurrency` | NVD requests in flight at the same time | 1 |
 | `nvdJitterPct` | randomised extra spacing per NVD request, in percent of the window interval — keeps a queue from leaving its pause as a salvo (v0.6.5) | 20 |
 | `nvdBackoffCapMs` | upper bound of the exponential 429 backoff | 60000 |

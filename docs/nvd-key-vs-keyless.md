@@ -26,6 +26,14 @@ A key is validated with a live NVD call before it is saved. A key that stops wor
 revocation) is caught by a background probe at startup, which prints the same line again rather
 than querying silently into 401s.
 
+Since v0.6.6 the probe result is a state, not a yes/no: **`valid`**, **`rejected`** or
+**`unknown`** (a 429 or a network error says nothing about the key and is probed again later).
+The key travels in the HTTP header `apiKey`, which is what NVD API 2.0 documents — as a query
+parameter NVD rejects it with `404` and the response header `message: Invalid parameter: apiKey.`,
+and an empty-body 404 with `message: Invalid apiKey.` is NVD refusing the value itself. A rejected
+key is still saved and the badge turns red instead of green: the per-product requests then go out
+keyless at the keyless limit, so a wrong key costs enrichment rather than all progress.
+
 Get a key free at <https://nvd.nist.gov/developers/request-an-api-key>; NVD emails it immediately,
 no approval wait in practice.
 
@@ -47,8 +55,12 @@ cheap, critical signal either way. `cve_detail` always uses NVD directly.
 ## How a run tells you which mode it was in
 
 - Every `check_cves` result carries `mode: "nvd-keyed" | "keyless-osv+cached"`, plus
-  `nvd_key` (`env` / `config` / `null`) and the `product_cache` counters
+  `nvd_key` (`env` / `config` / `null`), `nvd_key_status` (`valid` / `rejected` / `unknown`, since
+  v0.6.6) and the `product_cache` counters
   (`products_cached`, `refreshed`, `deferred`, `fetched_at`).
+- Because a rejected key keeps the mode `nvd-keyed` while its requests actually run unauthenticated,
+  the mode alone is not enough: `completeness.reasons` carries `nvd_key_rejected` and the answer sets
+  `completeness.needs_attention` (v0.6.6).
 - `list_todos` ends with a `lookup mode:` line, read from the store, so the list describes the run
   that produced it even long after that call.
 - The dashboard shows the mode as a badge in the **NVD API key** section and as a card in the

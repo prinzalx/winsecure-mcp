@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { buildTodo, mergeTodo, normalizeAssessment, severityRank, buildEvidence, todoId, compareTodoRank, groupMatchesIntoTodos, ratingConfidence } from "../dist/modules/todos/todo.js";
-import { parseJsonObject } from "../dist/modules/todos/index.js";
+import { parseJsonObject, todoTools } from "../dist/modules/todos/index.js";
 
 function hit(cveId, over = {}) {
   return {
@@ -171,6 +171,18 @@ test("buildEvidence exposes exactly the axes a-d and the CVE signals", () => {
   assert.equal(ev.program, "Example Tool");
   assert.ok(ev.install_sources.includes("registry"));
   assert.equal(ev.match_confidence, "medium");
+});
+
+test("save_assessment accepts an explicit null affected_part", () => {
+  const tool = todoTools.find((t) => t.name === "save_assessment");
+  const base = { todo_id: "todo-1", exe_swap_only: false, new_setup_needed: true, breaking_change_expected: false, reason: "vendor setup" };
+  // The docs and the skill tell the agent "otherwise null", so null must parse.
+  const nullParsed = tool.input.safeParse({ ...base, affected_part: null });
+  assert.equal(nullParsed.success, true, JSON.stringify(nullParsed.error?.issues));
+  assert.equal(nullParsed.data.affected_part, null);
+  assert.equal(tool.input.safeParse({ ...base, affected_part: "WebView2" }).success, true);
+  assert.equal(tool.input.safeParse({ ...base, affected_part: 5 }).success, false);
+  assert.equal(tool.input.safeParse({ ...base, todo_id: "" }).success, false);
 });
 
 test("parseJsonObject survives prose and code fences", () => {

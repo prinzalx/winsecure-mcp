@@ -1,6 +1,6 @@
 {
   "name": "winsecure-mcp",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Windows CVE inventory MCP server: installed software against CVE sources, with a persistent ToDo list and AI effort assessments",
   "type": "module",
   "license": "MIT",

@@ -185,9 +185,9 @@
         const inv = state.inventory;
         $("#inv-cards").innerHTML =
           card(inv.programs, "programs (deduplicated)", inv.scanned_at ? `scanned ${inv.scanned_at}` : "never scanned") +
-          card(inv.per_source.registry ?? 0, "from registry", "HKLM + HKCU incl. WOW6432Node") +
-          card(inv.per_source.winget ?? 0, "from winget", "store / winget-managed") +
-          card(inv.per_source.portable ?? 0, "from portable .exe", "bounded drive walk") +
+          card(inv.per_source.registry ?? 0, "from registry", "after dedup · HKLM + HKCU incl. WOW6432Node") +
+          card(inv.per_source.winget ?? 0, "from winget", "after dedup · store / winget-managed") +
+          card(inv.per_source.portable ?? 0, "from portable .exe", "after dedup · bounded drive walk") +
           card(inv.with_package_id, "with package id", "strongest match identity");
 
         const t = state.todos;

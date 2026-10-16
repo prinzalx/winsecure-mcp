@@ -44,7 +44,7 @@ client's log instead.
 ██║███╗██║██║██║╚██╗██║╚════██║██╔══╝  ██║     ██║   ██║██╔══██╗██╔══╝     ██║╚██╔╝██║██║     ██╔═══╝
 ╚███╔███╔╝██║██║ ╚████║███████║███████╗╚██████╗╚██████╔╝██║  ██║███████╗   ██║ ╚═╝ ██║╚██████╗██║
  ╚══╝╚══╝ ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝   ╚═╝     ╚═╝ ╚═════╝╚═╝
-  version         v0.5.0
+  version         v0.5.1
   data directory  C:\Users\<user>\AppData\Roaming\winsecure-mcp
   store file      C:\Users\<user>\AppData\Roaming\winsecure-mcp\winsecure.json
   web interface   http://0.0.0.0:8788
@@ -187,7 +187,7 @@ node scripts/banner.mjs  # regenerate the console logo
 ```
 scan_inventory → 357 programs after dedup (registry 205, winget 209, portable 40 cut at max)
 check_cves     → cvelist index 1991 CVEs / 1169 products (0.7 % coverage, cold-start phase)
-list_todos     → the v0.5.0 verdict rules turned this run's 6 false positives into zero to-dos
+list_todos     → the v0.5.0 verdict rules turned this run's 6 false positives into 1 unconfirmed row
 assess_todo    → evidence package returned (client cannot sample); saved via save_assessment
 cve_detail     → CVE-2024-21412: CVSS 8.1 — Internet Shortcut Files Security Feature Bypass
 ```
@@ -196,8 +196,12 @@ The live beta (v0.4.0) produced six to-dos on this host and **all six were uncon
 matches, none an actual exposure**: two Edge versions matched the same two 2016 EdgeHTML CVEs as
 two separate rows, WhatsApp 2.2639 a 2019 CVE, Git 2.55 a CVE affecting Git < 2.50.1, 7-Zip 26.02 a
 CVE affecting < 24.07, and Notepad++ 7.54 came from two installer `.exe` files in document folders.
-After the v0.5.0 verdict rules the same run reports `0 CVE hit(s) ... 8 name match(es) rejected by
-the version verdict`, i.e. no to-do for Edge, WhatsApp, Git or 7-Zip.
+After the v0.5.0 verdict rules the verification run on the same host reports `8 name match(es)
+rejected by the version verdict` and **one remaining to-do**. Edge, both WhatsApp CVEs, Git and
+Notepad++ are gone. The survivor is 7-Zip 26.02 vs CVE-2025-0411: the affected range (< 24.07) is
+not in the thin 0.7 % index yet, and KEV membership exempts the pair from the era heuristic, so a
+known-patched program stays as one low-confidence unconfirmed row rather than a claim of exposure.
+That is the intended leniency for KEV entries, not a hit ranked above a confirmed one.
 
 Offline test (`WSMD_OFFLINE=1`, cold cache): inventory 357 programs, `cve_status: "unknown"`,
 `source_errors: ["offline","offline"]`, no failures.

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { normName } from "../dist/utils/matching.js";
-import { kevForProduct } from "../dist/modules/cves/feeds.js";
+import { fetchEpss, indexRegression, kevForProduct } from "../dist/modules/cves/feeds.js";
 import { candidates, versionAffected, matchProgram, eraImplausible } from "../dist/modules/cves/engine.js";
 import { enrichKevHits } from "../dist/modules/cves/index.js";
 
@@ -210,4 +210,46 @@ test("a KEV-only hit is enriched from the local index by CVE id", () => {
   assert.equal(hit.fixed_version, "1.3.0");
   assert.equal(hit.summary, "remote code execution");
   assert.equal(hit.published, "2026-02-02T00:00:00Z");
+});
+
+test("fetchEpss reports an unreachable feed instead of a silent null", async () => {
+  const dead = {
+    get: async () => ({ body: null, from: "none", fetched_at: null, error: "offline" }),
+    getBinary: async () => ({ body: null, from: "none", fetched_at: null, error: "offline" }),
+  };
+  const res = await fetchEpss(dead, 1000, ["CVE-2025-0411"]);
+  assert.equal(res.scores.size, 0);
+  assert.match(res.error ?? "", /epss: offline/);
+
+  const okHttp = {
+    get: async () => ({ body: JSON.stringify({ data: [{ cve: "CVE-2025-0411", epss: "0.42" }] }), from: "network", fetched_at: null }),
+    getBinary: async () => ({ body: null, from: "none", fetched_at: null }),
+  };
+  const good = await fetchEpss(okHttp, 1000, ["CVE-2025-0411"]);
+  assert.equal(good.scores.get("CVE-2025-0411"), 0.42);
+  assert.equal(good.error, undefined);
+
+  const empty = await fetchEpss(dead, 1000, []);
+  assert.equal(empty.scores.size, 0);
+  assert.equal(empty.error, undefined, "no ids to ask for is not a feed error");
+});
+
+test("indexRegression warns when the accumulated index gets smaller", () => {
+  // indexRegression reads totalCves and byProduct.size, so the fake map must carry the products.
+  const mk = (cves, products) => ({
+    tag: null,
+    fetched_at: null,
+    byProduct: new Map(Array.from({ length: products }, (_, i) => [`p${String(i)}`, []])),
+    byCve: new Map(),
+    totalCves: cves,
+  });
+  assert.equal(indexRegression(null, mk(10, 5)), undefined, "no previous file is no regression");
+  assert.equal(indexRegression({ cves: 10, products: 5 }, mk(12, 6)), undefined, "growth stays quiet");
+  assert.equal(indexRegression({ cves: 10, products: 5 }, mk(10, 5)), undefined, "equal counters stay quiet");
+
+  const shrunk = indexRegression({ cves: 2043, products: 1209 }, mk(1991, 1169));
+  assert.match(shrunk ?? "", /shrank from 2043 CVEs \/ 1209 products to 1991 \/ 1169/);
+
+  const reset = indexRegression({ cves: 2043, products: 1209 }, mk(0, 0));
+  assert.match(reset ?? "", /accumulation restarted/);
 });

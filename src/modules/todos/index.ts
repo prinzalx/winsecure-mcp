@@ -159,7 +159,9 @@ export const todoTools: ToolDefinition[] = [
       exe_swap_only: z.boolean().describe("(a) only the .exe/file has to be replaced"),
       new_setup_needed: z.boolean().describe("(b) a new setup from the vendor is needed"),
       breaking_change_expected: z.boolean().describe("(c) a breaking change is expected"),
-      affected_part: z.string().optional().describe("(d) name the part program when only part of a suite is affected"),
+      // Nullable on purpose: the tool description and the skill both tell the agent to answer
+      // "otherwise null", so an explicit null must not be rejected as an invalid input.
+      affected_part: z.string().nullable().optional().describe("(d) name the part program when only part of a suite is affected; null when the whole program is"),
       reason: z.string().min(1).describe("Short justification"),
       confidence: z.enum(CONFIDENCES).optional().describe("How sure the assessment is. Defaults to medium"),
       dismiss: z.boolean().optional().describe("Set the status to dismissed instead of assessed"),

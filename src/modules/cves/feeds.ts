@@ -161,7 +161,7 @@ export async function loadProductIndex(
   cacheDir: string,
 ): Promise<ProductIndex> {
   const indexPath = join(cacheDir, "cvelist-index.json");
-  const index = readIndex(indexPath);
+  const { index, prev } = readIndex(indexPath);
   const res = await http.get(GITHUB_RELEASES, ttlMs);
 
   const fail = (error: string): ProductIndex => ({
@@ -205,6 +205,9 @@ export async function loadProductIndex(
 
   index.tag = release.tag_name;
   index.fetched_at = new Date().toISOString();
+
+  const regression = indexRegression(prev, index);
+  const trimmed = merged.cves === 0 ? "the delta contained no parsable CVE records" : undefined;
   writeIndex(indexPath, index);
 
   return {
@@ -214,7 +217,7 @@ export async function loadProductIndex(
     products: index.byProduct.size,
     fetched_at: index.fetched_at,
     from: "network",
-    error: merged.cves === 0 ? "the delta contained no parsable CVE records" : undefined,
+    error: [trimmed, regression].filter((e): e is string => Boolean(e)).join("; ") || undefined,
   };
 }
 
@@ -227,11 +230,35 @@ interface MutableIndex {
   totalCves: number;
 }
 
-function readIndex(path: string): MutableIndex {
+/** The counters an index file carried on its last write; the input of the monotonicity guard. */
+export interface IndexTotals {
+  cves: number;
+  products: number;
+}
+
+function emptyIndex(): MutableIndex {
+  return { tag: null, fetched_at: null, byProduct: new Map(), byCve: new Map(), totalCves: 0 };
+}
+
+/**
+ * Reads the accumulated index, or an empty one when the file does not exist yet.
+ *
+ * A file that exists but cannot be parsed is the suspected shrinkage path (an interrupted write
+ * silently resets months of accumulation to zero), so it is reported on stderr and kept next to
+ * the fresh file as `.bak` instead of vanishing. Never fails the run.
+ */
+function readIndex(path: string): { index: MutableIndex; prev: IndexTotals | null } {
+  let rawText: string;
   try {
-    const raw = JSON.parse(readFileSync(path, "utf8")) as {
+    rawText = readFileSync(path, "utf8");
+  } catch {
+    return { index: emptyIndex(), prev: null };
+  }
+  try {
+    const raw = JSON.parse(rawText) as {
       tag?: string | null;
       fetched_at?: string | null;
+      totals?: IndexTotals;
       records?: CveRecord[];
     };
     const byProduct = new Map<string, CveRecord[]>();
@@ -244,9 +271,32 @@ function readIndex(path: string): MutableIndex {
       else byProduct.set(key, [rec]);
       if (!byCve.has(rec.cve_id)) byCve.set(rec.cve_id, rec);
     }
-    return { tag: raw.tag ?? null, fetched_at: raw.fetched_at ?? null, byProduct, byCve, totalCves: byCve.size };
-  } catch {
-    return { tag: null, fetched_at: null, byProduct: new Map(), byCve: new Map(), totalCves: 0 };
+    return {
+      index: { tag: raw.tag ?? null, fetched_at: raw.fetched_at ?? null, byProduct, byCve, totalCves: byCve.size },
+      prev: raw.totals ?? { cves: byCve.size, products: byProduct.size },
+    };
+  } catch (cause) {
+    // A truncated file still carries the `totals` object near its start, which is what the guard
+    // needs; recovering it keeps the warning informative even when the parse died further down.
+    const totalsMatch = /"totals"\s*:\s*\{[^}]*\}/.exec(rawText);
+    let prev: IndexTotals | null = null;
+    if (totalsMatch) {
+      try {
+        prev = JSON.parse(totalsMatch[0].replace(/^"totals"\s*:\s*/, "")) as IndexTotals;
+      } catch {
+        prev = null;
+      }
+    }
+    process.stderr.write(
+      `  cvelist index unreadable (${String(cause instanceof Error ? cause.message : cause)}),` +
+        ` rebuilding from the next delta${prev ? ` — was ${String(prev.cves)} CVEs` : ""}\n`,
+    );
+    try {
+      writeFileSync(`${path}.bak`, rawText, "utf8");
+    } catch {
+      // The backup is best effort; losing it costs the forensic look, nothing more.
+    }
+    return { index: emptyIndex(), prev };
   }
 }
 
@@ -254,10 +304,36 @@ function writeIndex(path: string, index: MutableIndex): void {
   try {
     mkdirSync(join(path, ".."), { recursive: true });
     const records = [...index.byProduct.values()].flat();
-    writeFileSync(path, JSON.stringify({ tag: index.tag, fetched_at: index.fetched_at, records }), "utf8");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        tag: index.tag,
+        fetched_at: index.fetched_at,
+        totals: { cves: index.totalCves, products: index.byProduct.size },
+        records,
+      }),
+      "utf8",
+    );
   } catch {
     // An index that cannot be persisted is rebuilt on the next run; nothing is lost but time.
   }
+}
+
+/**
+ * Compares the merged totals against the counters the file carried before, and warns when the
+ * accumulated index got smaller. The merge itself only adds, so a drop means the accumulation was
+ * reset (unreadable file, a rebuild from a single delta) and coverage will have to grow again.
+ */
+export function indexRegression(prev: IndexTotals | null, index: MutableIndex): string | undefined {
+  if (!prev) return undefined;
+  const cves = index.totalCves;
+  const products = index.byProduct.size;
+  if (cves >= prev.cves && products >= prev.products) return undefined;
+  const note =
+    `cvelist index shrank from ${String(prev.cves)} CVEs / ${String(prev.products)} products ` +
+    `to ${String(cves)} / ${String(products)}; accumulation restarted`;
+  process.stderr.write(`  warning: ${note}\n`);
+  return note;
 }
 
 /** cvelistV5 JSON in the CVE 5.0 schema, as far as this server reads it. */
@@ -397,13 +473,19 @@ function pickFixed(current: string | null, candidate: string | null, below: stri
 /**
  * Fetches EPSS scores in batches of 100 (the API's own limit), all served from the disk cache.
  *
- * Returns a map of CVE id -> probability. A CVE the API does not know simply is absent, which the
- * caller renders as a null score rather than an error.
+ * Returns the map of CVE id -> probability plus an `error` when a batch was unreachable, so a
+ * dead feed shows up in `source_errors` instead of leaving every score silently null. A CVE the
+ * API does not know simply is absent from the map, which the caller renders as a null score.
  */
-export async function fetchEpss(http: Http, ttlMs: number, cveIds: string[]): Promise<Map<string, number>> {
+export async function fetchEpss(
+  http: Http,
+  ttlMs: number,
+  cveIds: string[],
+): Promise<{ scores: Map<string, number>; error?: string }> {
   const out = new Map<string, number>();
   const unique = [...new Set(cveIds)].filter((id) => /^CVE-\d{4}-\d+$/i.test(id));
-  if (unique.length === 0) return out;
+  if (unique.length === 0) return { scores: out };
+  let error: string | undefined;
 
   const cacheOnly = process.env.WSMD_OFFLINE === "1";
   void cacheOnly;
@@ -412,7 +494,10 @@ export async function fetchEpss(http: Http, ttlMs: number, cveIds: string[]): Pr
     const batch = unique.slice(i, i + 100);
     const url = `${EPSS_API}?cve=${batch.join(",")}`;
     const res = await http.get(url, ttlMs);
-    if (!res.body) continue;
+    if (!res.body) {
+      error = `epss: ${res.error ?? "feed unreachable"}`;
+      continue;
+    }
     try {
       const j = JSON.parse(res.body) as { data?: { cve?: string; epss?: string }[] };
       for (const row of j.data ?? []) {
@@ -424,7 +509,7 @@ export async function fetchEpss(http: Http, ttlMs: number, cveIds: string[]): Pr
       // A malformed EPSS answer costs the score, not the run.
     }
   }
-  return out;
+  return error === undefined ? { scores: out } : { scores: out, error };
 }
 
 /**

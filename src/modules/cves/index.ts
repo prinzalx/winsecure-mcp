@@ -102,7 +102,11 @@ export const cveTools: ToolDefinition[] = [
       "fresh; when the network is down the expired cache is still used, and only a cold cache with no network yields " +
       "cve_status: \"unknown\" with the inventory left untouched by the CVE layer.\n" +
       "The cvelistV5 delta is accumulated into a local index on every run that finds a newer release, so coverage grows " +
-      "over days without the full 602 MB download. The answer reports how much the index currently covers.\n" +
+      "over days without the full 602 MB download. The answer reports how much the index currently covers. The counters " +
+      "are expected to be monotonic: when a merged index ends up smaller than the file it replaced, the run warns on " +
+      "stderr and names the drop in source_errors instead of quietly losing the accumulation.\n" +
+      "EPSS is looked up for every matched CVE — unconfirmed name matches included — and an unreachable feed appears in " +
+      "source_errors as an epss entry, so a null score is never silent.\n" +
       "Matching is name-based and carries a confidence per hit; an unsure match is reported with match_confidence and " +
       "never counted as a certain hit.\n" +
       "Before a name match becomes a hit the version verdict decides: a known affected range that excludes the " +
@@ -141,6 +145,8 @@ export const cveTools: ToolDefinition[] = [
       /** Name matches the version verdict rejected before they could become a hit (range or era). */
       let droppedByVerdict = 0;
       let skippedInstallerArtifacts = 0;
+      /** Set when the EPSS feed answered nothing reachable, so a null score is explained. */
+      let epssError: string | undefined;
 
       if (dataAvailable) {
         const matched: { entry: import("../../model.js").InventoryEntry; hits: import("../../model.js").CveHit[] }[] = [];
@@ -174,8 +180,12 @@ export const cveTools: ToolDefinition[] = [
         }
 
         if (args.with_epss !== false) {
-          const cveIds = newTodos.flatMap((t) => t.cves.filter((c) => c.unconfirmed !== true).map((c) => c.cve_id));
-          const scores = await fetchEpss(ctx.http, ttl(settings.epssTtlHours), cveIds);
+          // Every hit id is asked for, unconfirmed ones included: an EPSS score is a fact about
+          // the CVE, and a thin index that leaves the match unconfirmed must not cost the score.
+          const cveIds = newTodos.flatMap((t) => t.cves.map((c) => c.cve_id));
+          const epss = await fetchEpss(ctx.http, ttl(settings.epssTtlHours), cveIds);
+          if (epss.error) epssError = epss.error;
+          const scores = epss.scores;
           for (const t of newTodos) {
             for (const c of t.cves) if (scores.has(c.cve_id)) c.epss = scores.get(c.cve_id) ?? null;
             const max = t.cves.map((c) => c.epss).filter((x): x is number => x !== null);
@@ -228,7 +238,7 @@ export const cveTools: ToolDefinition[] = [
             },
           },
           todos: store.todos.length,
-          source_errors: [kev.error, index.error].filter((e): e is string => Boolean(e)),
+          source_errors: [kev.error, index.error, epssError].filter((e): e is string => Boolean(e)),
         },
         cveStatus === "unknown"
           ? `No CVE data reachable: inventory kept, ${String(store.todos.length)} todo(s) unchanged.`

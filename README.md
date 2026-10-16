@@ -125,9 +125,9 @@ carries the list of sources that reported it.
 
 | Source | Role | Notes |
 |---|---|---|
-| **NVD API 2.0** | **primary** — one query per installed product | `keywordSearch` on the product name, paged at 2000 per request. With an API key the limit is 50 requests / 30 s, keyless 5 / 30 s. Answers are cached per product with their `lastModified`, so later runs transfer only what changed. |
+| **NVD API 2.0** | **primary** — one query per installed product | `keywordSearch` on the product name, paged at 2000 per request. With an API key the limit is 50 requests / 30 s, keyless 5 / 30 s; since v0.6.3 the requests are paced to the window and an HTTP 429 pauses the whole queue (see Cold Start below). Answers are cached per product with their `lastModified`, so later runs transfer only what changed. |
 | **OSV.dev** batch query | keyless fallback | `POST /v1/querybatch` answers the whole inventory in one request without a key. Covers OSS-packaged software well, proprietary Windows software poorly. |
-| **cvelistV5** (GitHub) | deprecated offline fallback | The pre-v0.6.0 model: hourly **delta** (~5 MB) accumulated into `cache/cvelist-index.json`. Only consulted when both the product cache and KEV are empty (a cold cache with no network). |
+| **cvelistV5** (GitHub) | fallback index, loaded in every mode | The pre-v0.6.0 model: hourly **delta** (~5 MB) accumulated into `cache/cvelist-index.json`. Since v0.6.3 it is merged into every keyed and keyless answer (deduplicated by CVE id), so a keyed cold start never answers fewer hits than a keyless one. |
 | **CISA KEV** JSON feed | actively-exploited signal | Fully local in both modes — only ~1 700 entries, so it is the cheap critical signal. An exact product-name match hits only ~0.5 % of a real inventory (display name vs CVE product name), so an alias table + `match_confidence` bridge the gap. |
 | **EPSS** (FIRST) | prioritisation | Batch of ≤100 CVEs per call; fills `max_epss`. |
 
@@ -148,7 +148,9 @@ on the normalised name, installer artifacts excluded), `check_cves`:
 3. on the next run asks only for changes since that timestamp (`lastModStartDate` /
    `lastModEndDate`, inside NVD's 120-day window);
 4. applies the v0.5.x version verdict against the fetched affected ranges, so
-   `dropped_by_verdict` rejects a already-patched version from **complete** data on day one.
+   `dropped_by_verdict` rejects a already-patched version from **complete** data on day one;
+5. merges the cvelistV5 delta index in (since v0.6.3, deduplicated by CVE id), so ids the NVD
+   keyword search missed still produce hits — marked with their fallback source.
 
 Whether step 1 runs keyed or the whole thing falls back to a single OSV batch depends on the NVD
 API key: **`NVD_API_KEY`** in the environment wins, otherwise the key saved in the dashboard is
@@ -161,6 +163,35 @@ compares the two in one table: cost, speed, completeness, update semantics.
 Everything is cached on disk with a TTL, and **a scan run never depends on the network**. Without
 network the server still returns the inventory with `cve_status: "unknown"`. Privacy: only product,
 version and (when present) package id leave the machine — never paths, usernames or hostnames.
+
+### Cold Start / first run (since v0.6.3)
+
+The **first run needs time**, especially keyed: 425 products at NVD's 50-requests-per-30-window
+are minutes of work, not seconds. `check_cves` therefore does not block until the last product —
+it answers after a time budget (`nvdCallBudgetMs`, default 20 s, well under a typical MCP client
+transport timeout), products with a KEV hit asked first, and the rest of the queue drains in the
+background or on the next call. A failed lookup is not marked done: transient failures (429, 404,
+5xx, timeouts) stay deferred and are retried, only a real zero-result answer is cached briefly as
+`not_found`. Expect **several runs** before the NVD data is fully cached.
+
+The answer says how far it got:
+
+```json
+"completeness": {
+  "status": "incomplete",
+  "warming_up": true,
+  "reasons": ["425 of 425 product lookups unanswered", "212 product(s) rate limited (HTTP 429)"],
+  "lookups": { "total": 425, "cached": 13, "deferred": 0, "failed_429": 212, "failed_404": 4, "failed_other": 3, "not_found": 6 },
+  "hint": "Results incomplete — the NVD data was not fully reached (cold cache and/or rate limits). This is NOT \"patched\": re-run check_cves after a few minutes and compare before drawing a conclusion."
+}
+```
+
+**Few hits right after installation mean the data source was not fully reached yet, not
+"patched".** Check `completeness.status` (and the additive `checked_data` field, which sits next
+to the untouched `cve_status`) before concluding; re-run `check_cves` after a few minutes until it
+says `complete`. Progress is visible in `product_cache` (`products_cached` climbing, `deferred`
+falling towards 0) and on the dashboard's activity log, which since v0.6.3 names the product
+behind every per-product HTTP 429/404.
 
 ## The Assessment Mechanism (§5)
 
@@ -191,6 +222,10 @@ Defaults work out of the box; the server writes them out on first save.
 | `nvdApiKey` | NVD key saved from the dashboard (empty = keyless) | `null` |
 | `nvdProductsPerRun` | how many product answers one `check_cves` may refresh at NVD | 400 |
 | `nvdMaxPages` | page cap per product query, so Chrome cannot turn into 60 requests | 5 |
+| `nvdRatePerWindow` / `nvdWindowMs` | keyed NVD pacing: requests per window (NVD's documented keyed limit) | 50 / 30000 |
+| `nvdConcurrency` | NVD requests in flight at the same time | 1 |
+| `nvdCallBudgetMs` | time budget of the per-product walk inside one `check_cves` call; the rest drains in the background | 20000 |
+| `nvdNotFoundTtlHours` | how long a zero-result (not_found) NVD answer is trusted | 6 |
 | `portableExcludes` | paths never walked | see above |
 | `portableMaxResults` | cut-off for the portable walk | 40 |
 | `portableTimeoutMs` | portable walk budget | 60000 |

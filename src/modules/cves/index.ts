@@ -13,7 +13,7 @@ import {
   type ProductIndex,
 } from "../cves/feeds.js";
 import { candidates, matchProgram, severityOf } from "../cves/engine.js";
-import { lookupProducts, resolveNvdKey } from "./products.js";
+import { lookupProducts, resolveNvdKey, warmUpActive } from "./products.js";
 import { normName, productFamily } from "../../utils/matching.js";
 import type { CveHit, InventoryEntry } from "../../model.js";
 import { groupMatchesIntoTodos, mergeTodo } from "../todos/todo.js";
@@ -424,6 +424,15 @@ export const cveTools: ToolDefinition[] = [
             deferred: lookup.stats.deferred,
             fetched_at: lookup.stats.fetched_at,
           },
+          /**
+           * Whether this run's answer may be read as complete (task 4, v0.6.3). A cold or throttled
+           * NVD walk leaves products unanswered; that is NOT "no vulnerabilities", and a reader —
+           * especially an LLM agent — must re-run after a wait before drawing a conclusion. The
+           * existing `cve_status` values are untouched: `checked_data: "incomplete"` is the additive
+           * marker that sits next to them.
+           */
+          completeness: buildCompleteness(lookup.stats, warmUpActive(cacheDir), cveStatus),
+          checked_data: cveStatus === "unknown" ? "unknown" : lookup.stats.pending === 0 ? "complete" : "incomplete",
           /** The cvelist delta index that was merged in this run (loaded in every mode since v0.6.3). */
           cvelist: {
             deprecated: true,

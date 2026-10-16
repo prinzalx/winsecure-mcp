@@ -16,6 +16,8 @@ import { productNames } from "../dist/modules/cves/index.js";
 import { postCached } from "../dist/utils/net.js";
 
 const VALID_KEY = "0123456789abcdef0123456789abcdef";
+/** NVD's current format since 2025: a UUID with dashes, not 32 bare hex characters. */
+const UUID_KEY = "BB3F4D66-38C9-F111-8377-129478FCB64D";
 
 /** A {@link ConfigStore} stand-in: only `settings.nvdApiKey` matters to the key resolution. */
 function configWith(nvdApiKey, extra = {}) {
@@ -69,19 +71,24 @@ test("resolveNvdKey prefers NVD_API_KEY over the saved key", (t) => {
   assert.deepEqual(resolveNvdKey(configWith(null)), { key: null, source: null });
 });
 
-test("looksLikeNvdKey accepts only NVD's 32-hex format", () => {
+test("looksLikeNvdKey accepts the old 32-hex and the new UUID format", () => {
   assert.equal(looksLikeNvdKey(VALID_KEY), true);
   assert.equal(looksLikeNvdKey(VALID_KEY.toUpperCase()), true);
   assert.equal(looksLikeNvdKey(`  ${VALID_KEY}  `), true);
+  assert.equal(looksLikeNvdKey(UUID_KEY), true);
+  assert.equal(looksLikeNvdKey(UUID_KEY.toLowerCase()), true);
+  // Dashes are optional, so the same UUID without them passes too.
+  assert.equal(looksLikeNvdKey(UUID_KEY.replaceAll("-", "")), true);
   assert.equal(looksLikeNvdKey("abc"), false);
   assert.equal(looksLikeNvdKey(`${VALID_KEY}0`), false);
   assert.equal(looksLikeNvdKey("z123456789abcdef0123456789abcde"), false);
+  assert.equal(looksLikeNvdKey("BB3F4D66-38C9-F111-8377-129478FCB64"), false);
 });
 
 test("validateNvdKey rejects a malformed key without a network call", async () => {
   const check = await validateNvdKey("not-a-key");
   assert.equal(check.valid, false);
-  assert.match(String(check.error), /32-character/);
+  assert.match(String(check.error), /valid NVD key format/);
   assert.equal((await validateNvdKey("")).valid, false);
 });
 

@@ -197,23 +197,28 @@
         return `<div class="card"><div class="num" style="font-size:14px">${html}</div><div class="label">${esc(label)}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ""}</div>`;
       }
 
-      // Survives the periodic re-render, so a key typed in the field is not wiped by refresh().
-      let keyDraft = "";
+      // Survive the periodic re-render: a typed key must not be wiped by refresh(), and neither
+      // must the feedback line next to the field, which render() rewrites every 15 s.
+      let keyDraft: string | null = null;
+      let keyMsg = "";
+      /** The masked saved key from the server; the field shows it as its default value. */
+      let keyMasked: string | null = null;
 
       function render(state) {
         $("#meta").textContent =
           `v${state.version} · ${state.store_exists ? "store present" : "no scan stored yet"}` +
           ` · client sampling ${state.client_sampling === null ? "— no client yet" : state.client_sampling ? "yes" : "no"}`;
 
-        const cve = state.cve ?? { mode: null, key_present: false, key_source: null };
+        const cve = state.cve ?? { mode: null, key_present: false, key_source: null, key_masked: null };
+        keyMasked = cve.key_masked ?? null;
         const modePill = `<span class="pill ${cve.mode === "nvd-keyed" ? "mode-keyed" : "mode-keyless"}">${esc(cve.mode ?? "no lookup yet")}</span>`;
         $("#nvdkey").innerHTML =
           `<div class="keyrow">${modePill}` +
-          `<span class="pill ${cve.key_present ? "mode-keyed" : "mode-keyless"}">${cve.key_present ? `key set (${esc(cve.key_source ?? "?")})` : "no key"}</span>` +
-          `<input id="key-input" type="text" placeholder="paste a new NVD API key" autocomplete="off" value="${esc(keyDraft)}" />` +
+          `<span class="pill ${cve.key_present ? "mode-keyed" : "mode-keyless"}">${cve.key_present ? `key set (${esc(cve.key_source ?? "?")}${cve.key_masked ? ` · ${esc(cve.key_masked)}` : ""})` : "no key"}</span>` +
+          `<input id="key-input" type="text" placeholder="paste a new NVD API key" autocomplete="off" value="${esc(keyDraft ?? keyMasked ?? "")}" />` +
           `<button id="btn-key">save</button>` +
           `<button id="btn-key-clear">clear</button>` +
-          `<span class="muted" id="key-msg"></span></div>` +
+          `<span class="muted" id="key-msg">${esc(keyMsg)}</span></div>` +
           `<div class="muted" style="margin-top:8px">` +
           `Get a key free at <a href="https://nvd.nist.gov/developers/request-an-api-key">nvd.nist.gov/developers/request-an-api-key</a>. ` +
           `Keyed NVD queries every installed product; keyless falls back to an OSV batch plus the product cache and answers less completely. ` +
@@ -314,10 +319,10 @@
       $("#btn-scan").addEventListener("click", () => runTool("scan_inventory"));
       $("#btn-check").addEventListener("click", () => runTool("check_cves"));
       async function saveKey(key) {
-        const msg = $("#key-msg");
         const buttons = document.querySelectorAll("#nvdkey button");
         buttons.forEach((b) => (b.disabled = true));
-        msg.textContent = "validating…";
+        keyMsg = "validating…";
+        $("#key-msg").textContent = keyMsg;
         try {
           const res = await fetch("/api/nvd_key", {
             method: "POST",
@@ -325,10 +330,20 @@
             body: JSON.stringify({ key }),
           });
           const body = await res.json();
-          msg.textContent = res.ok ? (body.key_present ? "saved — running nvd-keyed" : "cleared — running keyless") : `rejected: ${body.error ?? "invalid key"}`;
-          if (!res.ok) $("#runlog").textContent = `[nvd_key] ${body.error ?? "invalid key"}`;
+          if (res.ok) {
+            keyMsg = body.key_present ? `saved (${body.key_masked ?? ""}) — next check_cves runs nvd-keyed` : "cleared — running keyless";
+            // Drop the draft so the field falls back to the fresh masked key from the server.
+            keyDraft = null;
+          } else {
+            keyMsg = `rejected: ${body.error ?? "invalid key"}`;
+            // Keep exactly what the user typed, so they can correct it in place.
+            keyDraft = key;
+          }
+          $("#runlog").style.display = "block";
+          $("#runlog").textContent = `[nvd_key] ${res.ok ? keyMsg : body.error ?? "invalid key"}`;
         } catch (err) {
-          msg.textContent = String(err);
+          keyMsg = String(err);
+          keyDraft = key;
         }
         buttons.forEach((b) => (b.disabled = false));
         await refresh();
@@ -344,17 +359,20 @@
           const field = $("#key-input");
           const value = field ? field.value.trim() : "";
           if (value === "") {
-            $("#key-msg").textContent = "paste a key first";
+            keyMsg = "paste a key first";
+            $("#key-msg").textContent = keyMsg;
             return;
           }
-          keyDraft = "";
+          // The unedited field shows the masked saved key; saving that text would store the mask.
+          if (value === (keyMasked ?? "\u0000")) {
+            keyMsg = "unchanged — paste a new key to replace it";
+            $("#key-msg").textContent = keyMsg;
+            return;
+          }
           void saveKey(value);
-          field.value = "";
         }
         if (ev.target?.id === "btn-key-clear") {
           keyDraft = "";
-          const field = $("#key-input");
-          if (field) field.value = "";
           void saveKey("");
         }
       });

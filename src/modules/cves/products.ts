@@ -43,9 +43,12 @@ export function resolveNvdKey(config: ConfigStore): NvdKeyState {
   return { key: null, source: null };
 }
 
-/** An NVD key is 32 lowercase hex characters; anything else cannot be one. */
+/**
+ * Format of an NVD key: NVD handed out 32 hex characters for years and now issues UUIDs with
+ * dashes, so both are accepted. Anything clearly shorter or with foreign characters cannot be one.
+ */
 export function looksLikeNvdKey(candidate: string): boolean {
-  return /^[0-9a-f]{32}$/i.test(candidate.trim());
+  return /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i.test(candidate.trim());
 }
 
 export interface KeyValidation {
@@ -64,7 +67,7 @@ export async function validateNvdKey(key: string, timeoutMs = 15_000): Promise<K
   const trimmed = key.trim();
   if (trimmed === "") return { valid: false, error: "no key given" };
   if (!looksLikeNvdKey(trimmed)) {
-    return { valid: false, error: "not a 32-character NVD key" };
+    return { valid: false, error: "not a valid NVD key format (32 hex chars or a UUID)" };
   }
   try {
     const res = await fetch(`${NVD_API}?keywordSearch=winsecure-mcp-key-probe&resultsPerPage=1&apiKey=${encodeURIComponent(trimmed)}`, {
@@ -74,6 +77,10 @@ export async function validateNvdKey(key: string, timeoutMs = 15_000): Promise<K
     if (res.ok) return { valid: true };
     const detail = await res.text().catch(() => "");
     if (res.status === 401) return { valid: false, error: "NVD rejected the key (HTTP 401)" };
+    // NVD currently answers a freshly issued key with 404 + "Invalid parameter: apiKey." while the
+    // activation has not propagated; like a 5xx this says nothing about the key, so it must not
+    // be reported as wrong, and the key stays usable.
+    if (res.status === 404) return { valid: true };
     // A 5xx or a rate-limit answer says nothing about the key, so it must not be reported as wrong.
     return { valid: false, error: `NVD answered HTTP ${String(res.status)}${detail ? `: ${detail.slice(0, 80)}` : ""}` };
   } catch (cause) {

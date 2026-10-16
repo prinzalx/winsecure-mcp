@@ -232,7 +232,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       tools: ALL_TOOLS,
       activity: activity.recent(20),
       clientSampling: attachedClientSampling,
-      nvdKey: { present: resolveNvdKey(config).key !== null, source: resolveNvdKey(config).source },
+      nvdKey: { present: resolveNvdKey(config).key !== null, source: resolveNvdKey(config).source, masked: maskNvdKey(resolveNvdKey(config).key) },
     }));
   }
 
@@ -248,23 +248,30 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       if (candidate === "") {
         config.settings.nvdApiKey = null;
         config.save();
-        return send(200, { ok: true, key_present: false, mode: "keyless-osv+cached" });
+        nvdKeyValidation = { valid: true, at: new Date().toISOString() };
+        return send(200, { ok: true, key_present: false, mode: "keyless-osv+cached", key_masked: null });
       }
       const check = await validateNvdKey(candidate, config.settings.httpTimeoutMs);
+      // Both outcomes are recorded, so `last_validation` is never null after a save and the
+      // dashboard can show the reason where the user clicked.
+      nvdKeyValidation = { ...check, at: new Date().toISOString() };
       if (!check.valid) {
         // The console contract: a failed validation says the same line the startup hint says.
         process.stderr.write("  no valid NVD API key — check dashboard\n");
-        return send(400, { ok: false, error: check.error ?? "invalid key" });
+        return send(400, { ok: false, error: check.error ?? "invalid key", last_validation: nvdKeyValidation });
       }
       config.settings.nvdApiKey = candidate;
       config.save();
-      return send(200, { ok: true, key_present: true, source: "config", mode: "nvd-keyed" });
+      process.stderr.write(`  NVD API key saved — mode nvd-keyed (${maskNvdKey(candidate)})\n`);
+      return send(200, { ok: true, key_present: true, source: "config", mode: "nvd-keyed", key_masked: maskNvdKey(candidate) });
     }
     const state = resolveNvdKey(config);
     return send(200, {
       key_present: state.key !== null,
       source: state.source,
       mode: state.key !== null ? "nvd-keyed" : "keyless-osv+cached",
+      // The browser never sees the whole key, only enough of it to keep the field readable.
+      key_masked: maskNvdKey(state.key),
       last_validation: nvdKeyValidation,
       request_url: "https://nvd.nist.gov/developers/request-an-api-key",
     });
@@ -295,6 +302,13 @@ const webCtx: ToolContext = { config, store, http, clientSampling: () => false, 
 
 /** The outcome of the background key probe started at launch, for the dashboard badge. */
 let nvdKeyValidation: { valid: boolean; error?: string; at: string } | null = null;
+
+/** `BB3F4D66-…-B64D`: enough for the input field to look like the key it replaced, no secret. */
+function maskNvdKey(key: string | null): string | null {
+  if (key === null || key === "") return null;
+  if (key.length <= 12) return `${key.slice(0, 3)}…`;
+  return `${key.slice(0, 8)}…${key.slice(-4)}`;
+}
 
 function serveHtml(res: ServerResponse): void {
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });

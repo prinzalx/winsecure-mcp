@@ -57,6 +57,8 @@ export interface DashboardState {
     mode: string | null;
     key_present: boolean;
     key_source: string | null;
+    /** Saved key shortened for display, so the dashboard field can show it as its own default. */
+    key_masked: string | null;
   };
   inventory: {
     programs: number;
@@ -141,7 +143,7 @@ export function computeState(options: {
   tools: ToolDefinition[];
   activity: ActivityEntry[];
   clientSampling: boolean | null;
-  nvdKey: { present: boolean; source: string | null };
+  nvdKey: { present: boolean; source: string | null; masked?: string | null };
 }): DashboardState {
   const { store } = options;
 
@@ -185,6 +187,7 @@ export function computeState(options: {
       mode: store.cve_mode ?? null,
       key_present: options.nvdKey.present,
       key_source: options.nvdKey.source,
+      key_masked: options.nvdKey.masked ?? null,
     },
     inventory: {
       programs: store.inventory.length,

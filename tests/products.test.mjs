@@ -257,7 +257,10 @@ test("lookupProducts holds products back at the per-run budget and says so", asy
     force: false,
   });
 
-  assert.equal(result.stats.deferred, 2, "the budget is visible instead of silent");
+  // Since v0.6.5 `deferred` is what remains open in the persistent queue after the run: the two
+  // products the count budget never reached PLUS the two that failed offline and were re-appended
+  // at the back for a later attempt. Failures are open work, not done work.
+  assert.equal(result.stats.deferred, 4, "the queue's open remainder is visible instead of silent");
 });
 
 test("a transient keyed failure leaves the product pending, not done", async (t) => {
@@ -343,6 +346,133 @@ test("a keyless osv entry does not count fresh in keyed mode", async (t) => {
   assert.equal(keyed.stats.failed_other, 1, "keyed mode re-queries an osv-sourced entry to enrich it");
   assert.equal(keyed.stats.pending, 1, "a failed re-fetch leaves it pending, never fresh");
   void readFileSync;
+});
+
+test("the keyed queue continues where it stopped instead of restarting at the front", async (t) => {
+  const previousKey = process.env.NVD_API_KEY;
+  process.env.NVD_API_KEY = VALID_KEY;
+  const previousOffline = process.env.WSMD_OFFLINE;
+  process.env.WSMD_OFFLINE = "1";
+  const cacheDir = tempCacheDir();
+  t.after(() => {
+    if (previousKey === undefined) delete process.env.NVD_API_KEY;
+    else process.env.NVD_API_KEY = previousKey;
+    if (previousOffline === undefined) delete process.env.WSMD_OFFLINE;
+    else process.env.WSMD_OFFLINE = previousOffline;
+    rmSync(cacheDir, { recursive: true, force: true });
+  });
+
+  // Every answer is a 429, so every product fails transiently and returns to the queue's back.
+  const asked = [];
+  const http429 = {
+    cacheDir,
+    async get(url) {
+      asked.push(new URL(url).searchParams.get("keywordSearch"));
+      return { body: null, from: "none", fetched_at: null, error: "HTTP 429", status: 429 };
+    },
+    async getBinary() {
+      return { body: null, from: "none", fetched_at: null, error: "HTTP 429", status: 429 };
+    },
+  };
+  const names = Array.from({ length: 4 }, (_, i) => ({ name: `p${String(i)}`, wanted: new Set([`p${String(i)}`]) }));
+
+  const first = await lookupProducts({
+    http: http429, config: configWith(null, { nvdProductsPerRun: 2 }), cacheDir, names, ttlMs: 24 * 60 * 60 * 1000, force: false,
+  });
+  assert.deepEqual(asked, ["p0", "p1"], "the count budget takes the queue head");
+  assert.equal(first.stats.failed_429, 2);
+  assert.equal(first.stats.deferred, 4, "2 never reached + 2 failed and re-queued are all still open");
+
+  asked.length = 0;
+  const second = await lookupProducts({
+    http: http429, config: configWith(null, { nvdProductsPerRun: 2 }), cacheDir, names, ttlMs: 24 * 60 * 60 * 1000, force: false,
+  });
+  assert.deepEqual(asked, ["p2", "p3"], "the second run continues at p2/p3, NOT again at p0/p1 (the v0.6.4 field bug)");
+  assert.equal(second.stats.failed_429, 2);
+
+  // And the third run wraps around to the re-queued failures — round-robin, nothing starves.
+  asked.length = 0;
+  await lookupProducts({
+    http: http429, config: configWith(null, { nvdProductsPerRun: 2 }), cacheDir, names, ttlMs: 24 * 60 * 60 * 1000, force: false,
+  });
+  assert.deepEqual(asked, ["p0", "p1"], "failed products wait at the back and are retried later");
+});
+
+test("a 404 whose body is an NVD envelope is a real zero-match answer, not a failure", async (t) => {
+  const previousKey = process.env.NVD_API_KEY;
+  process.env.NVD_API_KEY = VALID_KEY;
+  const previousOffline = process.env.WSMD_OFFLINE;
+  process.env.WSMD_OFFLINE = "1";
+  const cacheDir = tempCacheDir();
+  t.after(() => {
+    if (previousKey === undefined) delete process.env.NVD_API_KEY;
+    else process.env.NVD_API_KEY = previousKey;
+    if (previousOffline === undefined) delete process.env.WSMD_OFFLINE;
+    else process.env.WSMD_OFFLINE = previousOffline;
+    rmSync(cacheDir, { recursive: true, force: true });
+  });
+
+  const asked = [];
+  const http404 = {
+    cacheDir,
+    async get(url) {
+      asked.push(new URL(url).searchParams.get("keywordSearch"));
+      return {
+        body: null, from: "none", fetched_at: null, error: "HTTP 404", status: 404,
+        bodyText: '{"resultsPerPage":0,"totalResults":0,"format":"NVD_CVE","vulnerabilities":[]}',
+      };
+    },
+    async getBinary() {
+      return { body: null, from: "none", fetched_at: null, error: "HTTP 404", status: 404 };
+    },
+  };
+  const names = [{ name: "whatsapp", wanted: new Set(["whatsapp"]) }];
+
+  const first = await lookupProducts({
+    http: http404, config: configWith(null), cacheDir, names, ttlMs: 24 * 60 * 60 * 1000, force: false,
+  });
+  assert.equal(first.stats.not_found, 1, "an envelope 404 counts as not_found");
+  assert.equal(first.stats.failed_404, 0, "and NOT as a failure");
+  assert.equal(first.stats.pending, 0, "a real negative closes the product");
+
+  asked.length = 0;
+  await lookupProducts({
+    http: http404, config: configWith(null), cacheDir, names, ttlMs: 24 * 60 * 60 * 1000, force: false,
+  });
+  assert.deepEqual(asked, [], "within the not-found TTL the negative is trusted: no retry this run");
+});
+
+test("a 404 with an empty body (key flakiness) stays transient and is retried", async (t) => {
+  const previousKey = process.env.NVD_API_KEY;
+  process.env.NVD_API_KEY = VALID_KEY;
+  const previousOffline = process.env.WSMD_OFFLINE;
+  process.env.WSMD_OFFLINE = "1";
+  const cacheDir = tempCacheDir();
+  t.after(() => {
+    if (previousKey === undefined) delete process.env.NVD_API_KEY;
+    else process.env.NVD_API_KEY = previousKey;
+    if (previousOffline === undefined) delete process.env.WSMD_OFFLINE;
+    else process.env.WSMD_OFFLINE = previousOffline;
+    rmSync(cacheDir, { recursive: true, force: true });
+  });
+
+  const http404empty = {
+    cacheDir,
+    async get() {
+      return { body: null, from: "none", fetched_at: null, error: "HTTP 404", status: 404, bodyText: "" };
+    },
+    async getBinary() {
+      return { body: null, from: "none", fetched_at: null, error: "HTTP 404", status: 404 };
+    },
+  };
+  const result = await lookupProducts({
+    http: http404empty, config: configWith(null), cacheDir,
+    names: [{ name: "git", wanted: new Set(["git"]) }],
+    ttlMs: 24 * 60 * 60 * 1000, force: false,
+  });
+  assert.equal(result.stats.failed_404, 1, "an empty-body 404 is the flakiness shape: transient");
+  assert.equal(result.stats.not_found, 0, "it is not cached as a negative");
+  assert.equal(result.stats.pending, 1, "the product stays open for a retry");
 });
 
 test("mergeProductIndexes: primary records win, the fallback only adds missed ids", async () => {

@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 
 import { ARGS, loadConfig } from "./config.js";
 import { computeState, createActivity, type Activity } from "./dashboard.js";
-import { resolveNvdKey, validateNvdKey } from "./modules/cves/products.js";
+import { startIdleDrain, stopIdleDrain, resolveNvdKey, validateNvdKey } from "./modules/cves/products.js";
+import { productNames } from "./modules/cves/index.js";
 import { ALL_TOOLS, TOOLS_BY_NAME } from "./modules/index.js";
 import { openStore, storeExists, type DataStore } from "./store.js";
 import type { ToolContext, ToolDefinition } from "./types.js";
@@ -250,6 +251,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
         config.settings.nvdApiKey = null;
         config.save();
         nvdKeyValidation = { valid: true, at: new Date().toISOString() };
+        // Key removed: the drain must not keep querying keyed (v0.6.5). It also notices by
+        // itself on the next tick; stopping here is the clean cut.
+        stopIdleDrain(http.cacheDir);
         return send(200, { ok: true, key_present: false, mode: "keyless-osv+cached", key_masked: null });
       }
       const check = await validateNvdKey(candidate, config.settings.httpTimeoutMs);
@@ -263,6 +267,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       }
       config.settings.nvdApiKey = candidate;
       config.save();
+      // A saved key re-arms the drain without a restart, continuing the persisted queue (v0.6.5).
+      armNvdDrain();
       process.stderr.write(`  NVD API key saved — mode nvd-keyed (${maskNvdKey(candidate)})\n`);
       return send(200, { ok: true, key_present: true, source: "config", mode: "nvd-keyed", key_masked: maskNvdKey(candidate) });
     }
@@ -304,6 +310,31 @@ const webCtx: ToolContext = { config, store, http, clientSampling: () => false, 
 /** The outcome of the background key probe started at launch, for the dashboard badge. */
 let nvdKeyValidation: { valid: boolean; error?: string; at: string } | null = null;
 
+/**
+ * The server-side NVD idle drain (v0.6.5, task 3): the keyed queue keeps working between
+ * `check_cves` calls instead of only inside a call's time budget. The binding re-reads the store
+ * per tick, so a scan feeds the queue and a key change between calls takes effect without a
+ * restart; removing the key stops the timer by itself.
+ */
+function armNvdDrain(): void {
+  startIdleDrain({
+    http,
+    config,
+    cacheDir: http.cacheDir,
+    names: () => productNames(store.load().inventory),
+    ttlMs: config.settings.cvelistTtlHours * 60 * 60 * 1000,
+    onStatus: (product, status) =>
+      activity.add({
+        at: new Date().toISOString(),
+        tool: "check_cves",
+        ok: false,
+        duration_ms: 0,
+        origin: "nvd",
+        summary: `${product}: HTTP ${String(status)} (idle drain)`,
+      }),
+  });
+}
+
 /** `BB3F4D66-…-B64D`: enough for the input field to look like the key it replaced, no secret. */
 function maskNvdKey(key: string | null): string | null {
   if (key === null || key === "") return null;
@@ -331,6 +362,8 @@ async function main(): Promise<void> {
     typeof hostArg === "string" && hostArg !== ""
       ? hostArg
       : (process.env.WSMD_HOST ?? "0.0.0.0");
+
+  armNvdDrain();
 
   const httpServer = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -396,6 +429,7 @@ async function main(): Promise<void> {
 
   // When the MCP client closes stdin, the web interface must not keep the process alive.
   const shutdown = () => {
+    stopIdleDrain(http.cacheDir);
     httpServer.close();
     void server.close();
     process.exit(0);

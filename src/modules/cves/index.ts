@@ -13,7 +13,7 @@ import {
   type ProductIndex,
 } from "../cves/feeds.js";
 import { candidates, matchProgram, severityOf } from "../cves/engine.js";
-import { lookupProducts, resolveNvdKey, warmUpActive } from "./products.js";
+import { drainActive, lookupProducts, resolveNvdKey, startIdleDrain } from "./products.js";
 import { normName, productFamily } from "../../utils/matching.js";
 import type { CveHit, InventoryEntry } from "../../model.js";
 import { groupMatchesIntoTodos, mergeTodo } from "../todos/todo.js";
@@ -245,13 +245,19 @@ export const cveTools: ToolDefinition[] = [
       "cached per product, so coverage is complete on day one instead of growing with the corpus. The answer reports the " +
       "mode and the cache stats. With a valid NVD key the mode is nvd-keyed: since v0.6.3 the requests are paced to " +
       "NVD's window (50 per 30 s by default, settings nvdRatePerWindow / nvdWindowMs) instead of fired as a salvo, an " +
-      "HTTP 429 pauses the whole queue for its Retry-After, and the call stops at the per-call time budget " +
-      "(nvdCallBudgetMs, default 20 s) and lets the rest drain in the background — products with a KEV hit are asked " +
-      "first. Without a key the server falls back to keyless-osv+cached — one OSV batch query plus whatever the " +
+      "HTTP 429 pauses the whole queue for its Retry-After (Cloudflare's bursts answer 429 'error code: 1015' with " +
+      "Retry-After: 0, so an exponential backoff with jitter decides the wait), and the call stops at the per-call " +
+      "time budget (nvdCallBudgetMs, default 20 s) while a server-side idle-drain timer keeps fetching between calls " +
+      "— products with a KEV hit are asked first. Without a key the server falls back to keyless-osv+cached — one OSV batch query plus whatever the " +
       "product cache already holds — which is thinner, and the answer says so rather than letting a small hit count " +
       "look like a clean machine.\n" +
-      "Since v0.6.3 a failed lookup is not done: transient failures (429/404/5xx/timeout) leave the product deferred " +
-      "and it is retried on a later run; only a full answer with zero results caches a short-lived not_found marker. " +
+      "Since v0.6.3 a failed lookup is not done, and since v0.6.5 the queue that decides what is done is persistent: " +
+      "each product carries its state (pending/done/not_found/failed_transient) with attempt count and time, every " +
+      "call continues at the queue's current position, and a product that failed waits at the BACK (round-robin), so " +
+      "runs no longer restart at the same names while hundreds never come to word. An idle-drain server timer keeps " +
+      "working the queue between calls; deferred is the queue's open remainder and falls towards 0 across runs. " +
+      "A 404 whose body is an NVD envelope is a real zero-match answer (not_found, trusted for nvdNotFoundTtlHours, " +
+      "counted apart from failures); a 404 with an empty or foreign body is key/Cloudflare flakiness and transient. " +
       "A keyless OSV cache entry never counts fresh in keyed mode — it lacks CVSS and ranges, so keyed mode re-asks " +
       "NVD to enrich it.\n" +
       "The pre-v0.6.0 cvelist delta index is loaded in every mode since v0.6.3 and merged into the product answers " +
@@ -314,6 +320,26 @@ export const cveTools: ToolDefinition[] = [
         // runs proved the index is a real contributor. The merge below dedupes by CVE id.
         loadProductIndex(ctx.http, ttl(settings.cvelistTtlHours), cacheDir),
       ]);
+
+      // Since v0.6.5 the queue outlives the call: (re-)arm the server-side idle drain with a
+      // binding that re-reads the store per tick, so a scan feeds the queue and a key saved or
+      // removed between calls takes effect without a restart.
+      startIdleDrain({
+        http: ctx.http,
+        config: ctx.config,
+        cacheDir,
+        names: () => productNames(ctx.store.load().inventory),
+        ttlMs: settings.cvelistTtlHours * 60 * 60 * 1000,
+        onStatus: (product, status) =>
+          ctx.activity?.add({
+            at: new Date().toISOString(),
+            tool: "check_cves",
+            ok: false,
+            duration_ms: 0,
+            origin: "nvd",
+            summary: `${product}: HTTP ${String(status)} (idle drain)`,
+          }),
+      });
 
       // The product cache is the primary source; the delta index adds whatever it carries that the
       // per-product answers do not. Primary records win on id collisions — the NVD answer is the
@@ -442,7 +468,7 @@ export const cveTools: ToolDefinition[] = [
            * existing `cve_status` values are untouched: `checked_data: "incomplete"` is the additive
            * marker that sits next to them.
            */
-          completeness: buildCompleteness(lookup.stats, warmUpActive(cacheDir), cveStatus),
+          completeness: buildCompleteness(lookup.stats, drainActive(cacheDir), cveStatus),
           checked_data: cveStatus === "unknown" ? "unknown" : lookup.stats.pending === 0 ? "complete" : "incomplete",
           /** The cvelist delta index that was merged in this run (loaded in every mode since v0.6.3). */
           cvelist: {

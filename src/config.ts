@@ -66,12 +66,33 @@ export interface Settings {
   /** Requests issued at the same time against NVD. One is the safe default; the queue honors a pause as a whole. */
   nvdConcurrency: number;
   /**
+   * Extra randomised spacing per NVD request, in percent of the window interval (v0.6.5). The
+   * requests of a pause that just ended would otherwise leave it as a salvo again — Cloudflare
+   * in front of NVD bans exactly that shape (`error code: 1015`).
+   */
+  nvdJitterPct: number;
+  /** Upper bound of the exponential 429 backoff in milliseconds (v0.6.5). */
+  nvdBackoffCapMs: number;
+  /**
+   * Period of the server-side idle drain in milliseconds (v0.6.5). Between `check_cves` calls a
+   * timer keeps working the open NVD queue, so a cold start finishes in minutes instead of only
+   * ever advancing inside a call's time budget.
+   */
+  nvdIdleDrainMs: number;
+  /** How many open products one idle-drain tick processes at most (v0.6.5). */
+  nvdIdleDrainBatch: number;
+  /**
    * Wall-clock budget of the per-product NVD walk inside one `check_cves` call. When it runs out,
    * the call returns its partial answer and the rest of the queue continues in the background, so
    * a cold keyed start never blocks long enough to trip a client-side transport timeout.
    */
   nvdCallBudgetMs: number;
-  /** How long a `not_found` (HTTP 404 with a valid NVD envelope) answer is trusted before a retry. */
+  /**
+   * How long a `not_found` answer (an NVD envelope that matched zero CVEs — HTTP 200 with
+   * `totalResults: 0` or a 404 whose body is such an envelope) is trusted before the product is
+   * asked again. Raised to 7 days in v0.6.5: the answer is a real statement about the product,
+   * not a failure, and the new state tracking keeps it apart from transient errors.
+   */
   nvdNotFoundTtlHours: number;
   /** Root paths never walked by the portable-app scan. */
   portableExcludes: string[];
@@ -143,8 +164,12 @@ export function loadConfig(): ConfigStore {
     nvdRatePerWindow: 50,
     nvdWindowMs: 30_000,
     nvdConcurrency: 1,
+    nvdJitterPct: 20,
+    nvdBackoffCapMs: 60_000,
+    nvdIdleDrainMs: 30_000,
+    nvdIdleDrainBatch: 5,
     nvdCallBudgetMs: 20_000,
-    nvdNotFoundTtlHours: 6,
+    nvdNotFoundTtlHours: 168,
     portableExcludes: [...DEFAULT_EXCLUDES],
     portableMaxResults: 40,
     portableTimeoutMs: 60_000,
@@ -170,6 +195,10 @@ export function loadConfig(): ConfigStore {
     settings.nvdRatePerWindow = num(file.nvdRatePerWindow, settings.nvdRatePerWindow);
     settings.nvdWindowMs = num(file.nvdWindowMs, settings.nvdWindowMs);
     settings.nvdConcurrency = num(file.nvdConcurrency, settings.nvdConcurrency);
+    settings.nvdJitterPct = num(file.nvdJitterPct, settings.nvdJitterPct);
+    settings.nvdBackoffCapMs = num(file.nvdBackoffCapMs, settings.nvdBackoffCapMs);
+    settings.nvdIdleDrainMs = num(file.nvdIdleDrainMs, settings.nvdIdleDrainMs);
+    settings.nvdIdleDrainBatch = num(file.nvdIdleDrainBatch, settings.nvdIdleDrainBatch);
     settings.nvdCallBudgetMs = num(file.nvdCallBudgetMs, settings.nvdCallBudgetMs);
     settings.nvdNotFoundTtlHours = num(file.nvdNotFoundTtlHours, settings.nvdNotFoundTtlHours);
     if (Array.isArray(file.portableExcludes)) settings.portableExcludes = file.portableExcludes.map(String);

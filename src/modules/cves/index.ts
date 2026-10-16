@@ -126,6 +126,109 @@ export async function enrichKevHits(ctx: ToolContext, hits: CveHit[]): Promise<n
   return enriched;
 }
 
+/**
+ * Folds the cvelist delta index into the per-product answers, deduplicated by CVE id (task 3).
+ *
+ * The per-product records win on collision — an NVD answer carries CVSS, ranges and summaries the
+ * delta index may lack — and the index only adds ids the product answers missed. Both directions
+ * of `byCve` follow the same rule so a KEV-only enrichment lookup sees the enriched record first.
+ */
+export function mergeProductIndexes(primary: ProductIndex, fallback: ProductIndex): ProductIndex {
+  const byProduct = new Map<string, CveRecord[]>();
+  const byCve = new Map<string, CveRecord>(primary.byCve);
+  let totalRecords = 0;
+
+  for (const [name, recs] of primary.byProduct) {
+    byProduct.set(name, recs);
+    totalRecords += recs.length;
+  }
+  for (const [name, recs] of fallback.byProduct) {
+    const known = byProduct.get(name);
+    if (!known || known.length === 0) {
+      byProduct.set(name, recs);
+      totalRecords += recs.length;
+      for (const r of recs) if (!byCve.has(r.cve_id)) byCve.set(r.cve_id, r);
+      continue;
+    }
+    const seen = new Set(known.map((r) => r.cve_id));
+    let added = 0;
+    for (const r of recs) {
+      if (seen.has(r.cve_id)) continue;
+      seen.add(r.cve_id);
+      known.push(r);
+      added += 1;
+      if (!byCve.has(r.cve_id)) byCve.set(r.cve_id, r);
+    }
+    totalRecords += added;
+  }
+
+  return {
+    byProduct,
+    byCve,
+    totalCves: byCve.size,
+    products: byProduct.size,
+    fetched_at: primary.fetched_at ?? fallback.fetched_at,
+    from: primary.from !== "none" ? primary.from : fallback.from,
+    error: [primary.error, fallback.error].filter((e): e is string => Boolean(e)).join("; ") || undefined,
+  };
+}
+
+/**
+ * The machine-readable completeness verdict of a `check_cves` run (task 4).
+ *
+ * It answers the question the hit count cannot: "is few hits here because the machine is patched
+ * or because the data source was not fully reached yet?" A pending product list, a rate-limited
+ * lookup, or a background warm-up still running all make the answer `incomplete`, and the hint
+ * tells an agent to wait and re-run rather than conclude.
+ */
+export function buildCompleteness(
+  stats: import("./products.js").ProductLookupStats,
+  warmUpRunning: boolean,
+  cveStatus: "checked" | "unknown",
+): {
+  status: "complete" | "incomplete";
+  warming_up: boolean;
+  reasons: string[];
+  lookups: {
+    total: number;
+    cached: number;
+    deferred: number;
+    failed_429: number;
+    failed_404: number;
+    failed_other: number;
+    not_found: number;
+  };
+  hint: string;
+} {
+  const reasons: string[] = [];
+  if (cveStatus === "unknown") reasons.push("no CVE source reachable at all");
+  if (stats.pending > 0) reasons.push(`${String(stats.pending)} of ${String(stats.products_total)} product lookups unanswered`);
+  if (stats.deferred > 0) reasons.push(`${String(stats.deferred)} product(s) beyond the per-run budget`);
+  if (stats.failed_429 > 0) reasons.push(`${String(stats.failed_429)} product(s) rate limited (HTTP 429)`);
+  if (stats.failed_404 > 0) reasons.push(`${String(stats.failed_404)} product(s) answered 404 (NVD flakes on this with a key)`);
+  if (stats.failed_other > 0) reasons.push(`${String(stats.failed_other)} product(s) failed transiently`);
+  if (warmUpRunning) reasons.push("NVD warm-up continues in the background");
+
+  const incomplete = cveStatus === "unknown" || stats.pending > 0 || stats.deferred > 0 || warmUpRunning;
+  return {
+    status: incomplete ? "incomplete" : "complete",
+    warming_up: warmUpRunning || stats.pending > 0 || stats.deferred > 0,
+    reasons,
+    lookups: {
+      total: stats.products_total,
+      cached: stats.products_total - stats.pending,
+      deferred: stats.deferred,
+      failed_429: stats.failed_429,
+      failed_404: stats.failed_404,
+      failed_other: stats.failed_other,
+      not_found: stats.not_found,
+    },
+    hint: incomplete
+      ? "Results incomplete — the NVD data was not fully reached (cold cache and/or rate limits). This is NOT \"patched\": re-run check_cves after a few minutes and compare before drawing a conclusion."
+      : "All products were answered from NVD or a fresh cache.",
+  };
+}
+
 export const cveTools: ToolDefinition[] = [
   {
     name: "check_cves",
@@ -185,31 +288,36 @@ export const cveTools: ToolDefinition[] = [
         for (const cand of candidates(entry)) priority.add(normName(cand.name));
       }
 
-      const lookup = await lookupProducts({
-        http: ctx.http,
-        config: ctx.config,
-        cacheDir,
-        names: productNames(store.inventory),
-        ttlMs: ttl(settings.cvelistTtlHours),
-        force: args.refresh === true,
-        priority,
-      });
+      const [lookup, fallback] = await Promise.all([
+        lookupProducts({
+          http: ctx.http,
+          config: ctx.config,
+          cacheDir,
+          names: productNames(store.inventory),
+          ttlMs: ttl(settings.cvelistTtlHours),
+          force: args.refresh === true,
+          priority,
+        }),
+        // Since v0.6.3 the cvelist delta index loads in every mode (task 3): the keyed cold start
+        // that skipped it lost the hits its own NVD keyword queries missed, and the v0.6.2 keyless
+        // runs proved the index is a real contributor. The merge below dedupes by CVE id.
+        loadProductIndex(ctx.http, ttl(settings.cvelistTtlHours), cacheDir),
+      ]);
 
-      // The product cache is the primary source now. Only when it answers nothing at all (a cold
-      // cache plus no network) does the run fall back to whatever the legacy cvelist delta index
-      // still provides, so an offline host with an old store keeps answering.
-      let index: ProductIndex = {
-        byProduct: lookup.byProduct,
-        byCve: lookup.byCve,
-        totalCves: lookup.byCve.size,
-        products: lookup.byProduct.size,
-        fetched_at: lookup.stats.fetched_at,
-        from: lookup.stats.refreshed > 0 ? "network" : lookup.stats.products_cached > 0 ? "cache" : "none",
-      };
-      if (index.byProduct.size === 0 && kev.byCve.size === 0) {
-        const legacy = await loadProductIndex(ctx.http, ttl(settings.cvelistTtlHours), cacheDir);
-        if (legacy.byProduct.size > 0) index = legacy;
-      }
+      // The product cache is the primary source; the delta index adds whatever it carries that the
+      // per-product answers do not. Primary records win on id collisions — the NVD answer is the
+      // enriched one — and the fallback only contributes ids the primary missed.
+      const index = mergeProductIndexes(
+        {
+          byProduct: lookup.byProduct,
+          byCve: lookup.byCve,
+          totalCves: lookup.byCve.size,
+          products: lookup.byProduct.size,
+          fetched_at: lookup.stats.fetched_at,
+          from: lookup.stats.refreshed > 0 ? "network" : lookup.stats.products_cached > 0 ? "cache" : "none",
+        },
+        fallback,
+      );
 
 
       const dataAvailable = index.byProduct.size > 0 || kev.byCve.size > 0;
@@ -316,26 +424,19 @@ export const cveTools: ToolDefinition[] = [
             deferred: lookup.stats.deferred,
             fetched_at: lookup.stats.fetched_at,
           },
-          /** Deprecated: the pre-v0.6.0 cvelist delta index, kept as the offline fallback. */
+          /** The cvelist delta index that was merged in this run (loaded in every mode since v0.6.3). */
           cvelist: {
             deprecated: true,
-            cves: index.totalCves,
-            products: index.products,
-            from: index.from,
-            fetched_at: index.fetched_at,
+            cves: fallback.byProduct.size > 0 ? fallback.totalCves : 0,
+            products: fallback.byProduct.size,
+            from: fallback.from,
+            fetched_at: fallback.fetched_at,
             index_coverage: {
               local_cves: index.totalCves,
               corpus_estimate: CVELIST_FULL_CORPUS_ESTIMATE,
               percent: Number(((index.totalCves / CVELIST_FULL_CORPUS_ESTIMATE) * 100).toFixed(1)),
             },
           },
-          /**
-           * Whether this run's answer may be read as complete (task 4, v0.6.3). A cold or throttled
-           * NVD walk leaves products unanswered; that is NOT "no vulnerabilities", and a reader —
-           * especially an LLM agent — must re-run after a wait before drawing a conclusion. The
-           * existing `cve_status` values are untouched: `checked_data: "incomplete"` is the additive
-           * marker that sits next to them.
-           */
           todos: store.todos.length,
           source_errors: [
             kev.error,
@@ -345,6 +446,7 @@ export const cveTools: ToolDefinition[] = [
               ? ["running keyless, not optimal — rate limits apply, results may be less complete (no valid NVD API key — check dashboard)"]
               : []),
             ...lookup.stats.errors,
+            index.error,
             epssError,
           ].filter((e): e is string => Boolean(e)),
         },

@@ -345,6 +345,32 @@ test("a keyless osv entry does not count fresh in keyed mode", async (t) => {
   void readFileSync;
 });
 
+test("mergeProductIndexes: primary records win, the fallback only adds missed ids", async () => {
+  const { mergeProductIndexes } = await import("../dist/modules/cves/index.js");
+  const rec = (cve_id, cvss) => ({ cve_id, product: "git", vendor: null, summary: null, published: null, cvss, range_from: null, range_below: null, fixed_version: null });
+  const primary = {
+    byProduct: new Map([["git", [rec("CVE-2024-1", 9.8)]]]),
+    byCve: new Map([["CVE-2024-1", rec("CVE-2024-1", 9.8)]]),
+    totalCves: 1,
+    products: 1,
+    fetched_at: null,
+    from: "cache",
+  };
+  const fallback = {
+    byProduct: new Map([["git", [rec("CVE-2024-1", null), rec("CVE-2024-2", 5)]]]),
+    byCve: new Map([["CVE-2024-1", rec("CVE-2024-1", null)], ["CVE-2024-2", rec("CVE-2024-2", 5)]]),
+    totalCves: 2,
+    products: 1,
+    fetched_at: null,
+    from: "cache",
+  };
+  const merged = mergeProductIndexes(primary, fallback);
+  assert.deepEqual(merged.byProduct.get("git").map((r) => r.cve_id), ["CVE-2024-1", "CVE-2024-2"], "the missed id is added");
+  assert.equal(merged.byProduct.get("git")[0].cvss, 9.8, "the primary record wins a collision");
+  assert.equal(merged.byCve.get("CVE-2024-1").cvss, 9.8, "byCve keeps the enriched record");
+  assert.equal(merged.totalCves, 2, "deduplicated by CVE id");
+});
+
 test("postCached answers from disk within the TTL and writes one file per body", async (t) => {
   const { createServer } = await import("node:http");
   const previous = process.env.WSMD_OFFLINE;
